@@ -42,9 +42,9 @@ from pathlib import Path
 RPC_HOST = "127.0.0.1"
 RPC_PORT = 25586
 
-# 测试服务器（召唤生物用，经服务端 RCON）
-SERVER_SSH = "dev@127.0.0.1"
-SERVER_WORK_DIR = "~/minecraft"
+# 测试服务器（召唤生物用，本机直连 RCON，不绕 ssh）
+SERVER_HOST = "127.0.0.1"
+SERVER_RCON_PORT = 25575
 SUMMON_MOB = "minecraft:zombie"      # 用于测反击的中立化生物
 SUMMON_DIST = 10.0                   # 召唤在玩家多少格外（需 > 触及 3 格）
 
@@ -122,16 +122,15 @@ def rpc_ok(method: str, params: dict | None = None, timeout: float = 8.0) -> boo
 
 
 def server_rcon(command: str) -> str:
-    """经 ssh 在测试服执行一条 RCON 命令，返回输出末尾。"""
-    shell = (
-        f'PW=$(grep "rcon.password" {SERVER_WORK_DIR}/server.properties | cut -d= -f2); '
-        f'cd {SERVER_WORK_DIR} && RCON_PASSWORD="$PW" python3 server_rcon.py "{command}"'
-    )
-    out = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", SERVER_SSH, shell],
-        capture_output=True, text=True, timeout=30,
-    )
-    return (out.stdout + out.stderr).strip()
+    """经本地直连 RCON 在测试服执行一条命令，返回文本响应。
+
+    不再绕 ssh：密码经 ssh 读一次（见 rcon.get_password）后，所有命令
+    直连 127.0.0.1:25575，时序由本机脚本统一掌控。
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import rcon  # scripts/rcon.py
+    with rcon.open_default(SERVER_HOST, SERVER_RCON_PORT) as r:
+        return r.command(command)
 
 
 def read_client_log() -> str:
@@ -175,8 +174,8 @@ def stop_client() -> None:
     if os.name == "nt":
         try:
             out = subprocess.run(
-                ["tasklist"], capture_output=True, text=True, timeout=10,
-            ).stdout
+                ["tasklist"], capture_output=True, timeout=10,
+            ).stdout.decode("gbk", errors="replace")  # tasklist 输出是 GBK（中文系统）
             for line in out.splitlines():
                 if "java" in line.lower():
                     parts = line.split()
