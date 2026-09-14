@@ -11,16 +11,18 @@ mc-client-rpc 战斗闭环回归测试
   2. client.toTitle —— 跳过无障碍引导屏（dev 环境拦路界面）
   3. client.connect → 轮询「已进世界=true」
   4. player.respawn（若死亡）→ player.state 确认活着满血
-  5. 召唤僵尸：RCON 临时授 OP → 客户端 player.command 发 /summon → 立即 deop
-  6. world.entities 确认僵尸进入视野
-  7. player.moveToward → 轮询进入攻击触及范围（此刻已是普通玩家身份）
-  8. player.attack —— 触及范围内真实命中
-  9. 验证反击：玩家掉血/死亡（服务端权威）或客户端日志出现击杀记录
+  5. OP 身份：本用例需普通玩家，确保非 OP（is_op 查询），退出恢复原状
+  6. 召唤僵尸：服务管理指令走 RCON（与玩家 OP 无关，不伪装成玩家指令）
+  7. world.entities 确认僵尸进入视野
+  8. player.moveToward → 轮询进入攻击触及范围（普通玩家身份）
+  9. player.attack —— 触及范围内真实命中
+ 10. 验证反击：玩家掉血/死亡（服务端权威）或客户端日志出现击杀记录
 
-OP 权限管理（测试可控前置条件）：
-  - 仅 /summon 需要 OP，用 RCON 临时授予，召完立即 deop 还原普通玩家
-  - 反击验证全程以普通玩家身份进行（OP 被打行为可能不同，会偏离真实场景）
-  - 无论用例成败，OP 变更都在 finally 中移除，不污染服务器
+OP 权限管理（测试可控前置条件，恢复语义）：
+  - OP 是「被测玩家的身份变量」，不是发指令的手段
+  - 需要普通玩家的用例：确保非 OP 后测；需要 OP 的用例：授 OP 后测
+  - 「恢复」= 进入前 is_op 记录原状态，退出时 finally 还原成原样
+  - 服务管理指令（召唤/kill 等）与 OP 无关，一律走 RCON，不伪装成玩家指令
 
 判定「反击生效」的权威信号（三重，任一命中即算）：
   - player.state 血量下降或「死亡 是」
@@ -139,18 +141,34 @@ def server_rcon(command: str) -> str:
         return r.command(command)
 
 
-# ── OP 权限生命周期管理 ─────────────────────────────────────────────
+# ── OP 权限管理（测试可控前置条件，恢复语义）─────────────────────────
 #
-# OP 是测试的可控前置条件，由脚本全权管理：
-#   - 需要 OP 的用例（如 /summon）：开头 op，退出时 deop（finally 保证）
-#   - 需要普通玩家的用例（如反击/权限校验）：开头先 deop（Dev 可能本来就有 OP）
-# 无论用例成功/失败/中断，OP 变更都应在脚本退出时还原，不污染服务器。
+# OP 状态是「被测玩家的身份变量」，不是发指令的手段：
+#   - 需要普通玩家的用例（如反击/权限边界）：确保非 OP 后测，退出恢复原状
+#   - 需要 OP 玩家的用例（如 OP 攻击后行为差异）：授 OP 后测，退出恢复原状
+# 「恢复」= 进入前记录原状态，退出时还原成原样（原本是 OP 就恢复 OP，原本不是就不加）。
+# 服务管理指令（召唤/kill 等）与 OP 无关，一律走 RCON（见 server_rcon），不伪装成玩家指令。
+
+
+def is_op(player: str) -> bool:
+    """查询玩家是否为 OP（读服务端 ops.json，经 ssh 一次）。"""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import rcon as _r
+    out = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", _r.DEFAULT_SSH,
+         f"cat {_r.DEFAULT_WORK_DIR}/ops.json 2>/dev/null || echo '[]'"],
+        capture_output=True, text=True, timeout=15,
+    ).stdout
+    try:
+        ops = json.loads(out)
+        return any(e.get("name") == player for e in ops)
+    except ValueError:
+        return False
 
 
 def set_op(player: str, on: bool) -> None:
     """授予/移除玩家 OP（经 RCON，与玩家是否在线无关，脱机也生效）。"""
-    cmd = f"op {player}" if on else f"deop {player}"
-    server_rcon(cmd)
+    server_rcon(f"op {player}" if on else f"deop {player}")
 
 
 def read_client_log() -> str:
@@ -160,6 +178,21 @@ def read_client_log() -> str:
         return log.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
+
+
+def _parse_hp(state: str) -> float | None:
+    """从 player.state 文本解析玩家当前血量（'血量 20.0/20.0' → 20.0）。"""
+    import re
+    m = re.search(r"血量\s+([0-9.]+)/", state)
+    return float(m.group(1)) if m else None
+
+
+def _player_hp() -> float | None:
+    """查玩家当前血量（RPC player.state），失败返回 None。"""
+    try:
+        return _parse_hp(rpc("player.state", timeout=5))
+    except Exception:
+        return None
 
 
 # ── 客户端进程管理 ───────────────────────────────────────────────────
@@ -294,86 +327,98 @@ def main() -> int:
         raise step.fail("重生后仍死亡")
     step.ok(f"玩家存活: {state}")
 
-    # 4. 召唤僵尸：仅这一步需要 OP（/summon），召完立即 deop。
-    #    反击验证（步骤6-8）要求玩家是普通身份——OP 被打行为可能不同，
-    #    也偏离「普通玩家被反击」的真实场景。故 OP 生命周期严格限定在召唤内。
-    set_op(PLAYER_NAME, True)
-    step.info(f"已通过 RCON 授予 {PLAYER_NAME} OP（仅用于 /summon）")
+    # 4. OP 身份管理（恢复语义）：本用例测「普通玩家被反击」，需非 OP。
+    #    进入前记录原 OP 状态，确保非 OP 进行测试，退出时恢复原状。
+    original_op = is_op(PLAYER_NAME)
+    if original_op:
+        set_op(PLAYER_NAME, False)
+        step.info(f"{PLAYER_NAME} 原本是 OP，已临时移除（退出时恢复）")
+    else:
+        step.info(f"{PLAYER_NAME} 本非 OP，直接以普通玩家测试")
+
+    # 5. 召唤僵尸：服务管理指令走 RCON（与玩家 OP 无关，不伪装成玩家指令）。
+    retaliated = False  # 提前初始化：finally 后的判定要用，召唤失败时也有定义
     try:
-        summon = rpc("player.command", {
-            "cmd": f"execute at {PLAYER_NAME} run summon {SUMMON_MOB} ~{SUMMON_DIST} ~ ~ {{PersistenceRequired:1b}}"
-        })
-        step.ok(f"客户端指令召唤 {SUMMON_MOB}（{SUMMON_DIST} 格外）: {summon}")
-    finally:
-        # 召完立即移除 OP：后续走近/攻击/被反击都以普通玩家身份进行。
-        try:
-            set_op(PLAYER_NAME, False)
-            step.info(f"已移除 {PLAYER_NAME} OP（还原为普通玩家）")
-        except Exception as e:
-            step.info(f"⚠️ OP 移除失败（需手动检查）: {e}")
-    time.sleep(1.5)
+        summon = server_rcon(
+            f"execute at {PLAYER_NAME} run summon {SUMMON_MOB} ~{SUMMON_DIST} ~ ~ {{PersistenceRequired:1b}}"
+        )
+        step.ok(f"RCON 召唤 {SUMMON_MOB}（{SUMMON_DIST} 格外）: {summon or '(无回显)'}")
+        time.sleep(1.5)
 
-    # 5. 确认僵尸进入视野
-    ents = rpc("world.entities", {"radius": 32})
-    if "zombie" not in ents:
-        stop_client()
-        raise step.fail(f"召唤后视野内无 zombie: {ents}")
-    step.ok(f"视野内确认目标: {ents.strip().splitlines()[-1] if ents.strip() else ents}")
+        # 6. 确认僵尸进入视野
+        ents = rpc("world.entities", {"radius": 32})
+        if "zombie" not in ents:
+            raise step.fail(f"召唤后视野内无 zombie: {ents}")
+        step.ok(f"视野内确认目标: {ents.strip().splitlines()[-1] if ents.strip() else ents}")
 
-    # 6. moveToward 走近 → 轮询进入触及范围（此刻玩家已是普通身份）
-    rpc("player.moveToward", {"target": "zombie"})
+        # 6. moveToward 走近 → 轮询进入触及范围（此刻玩家已是普通身份）
+        rpc("player.moveToward", {"target": "zombie"})
 
-    def _in_reach():
-        st = rpc("player.state", timeout=5)
-        if "死亡 是" in st:
-            return True, "玩家已死亡（走近途中被反击）"  # 也算进入战斗
-        en = rpc("world.entities", {"radius": 4}, timeout=5)
-        return ("zombie" in en, f"走近中…… 状态: {st[:50]}")
-
-    reached = wait_until(_in_reach, TIMEOUT_WALK, desc="走近")
-    if not reached:
-        rpc("player.stop")
-        stop_client()
-        raise step.fail(f"{TIMEOUT_WALK}s 内未走近到触及范围")
-    step.ok("已进入攻击触及范围")
-
-    # 7. 连续攻击直到玩家被反击致死（或超时）
-    step.info("连续攻击，等待反击……")
-    log_before = read_client_log()
-    retaliated = False
-    deadline = time.time() + TIMEOUT_RETALIATE
-    while time.time() < deadline:
-        # 已死亡则反击成立
-        try:
+        def _in_reach():
             st = rpc("player.state", timeout=5)
-        except Exception:
-            break
-        if "死亡 是" in st or "血量 0.0" in st:
-            retaliated = True
-            step.info(f"玩家状态: {st}")
-            break
-        # 活着则继续打
-        try:
-            atk = rpc("player.attack", {"target": "zombie"}, timeout=5)
-            step.info(atk)
-        except Exception as e:
-            step.info(f"攻击异常（可能目标已死/走远）: {e}")
-        # 日志侧判定
-        new_log = read_client_log()
-        if new_log != log_before and ("was slain by" in new_log or "was shot by" in new_log):
-            if "was slain by" in new_log[len(log_before):] or "was shot by" in new_log[len(log_before):]:
-                retaliated = True
+            if "死亡 是" in st:
+                return True, "玩家已死亡（走近途中被反击）"  # 也算进入战斗
+            en = rpc("world.entities", {"radius": 4}, timeout=5)
+            return ("zombie" in en, f"走近中…… 状态: {st[:50]}")
+
+        reached = wait_until(_in_reach, TIMEOUT_WALK, desc="走近")
+        if not reached:
+            rpc("player.stop")
+            raise step.fail(f"{TIMEOUT_WALK}s 内未走近到触及范围")
+        step.ok("已进入攻击触及范围")
+
+        # 7. 连续攻击直到出现反击证据（或超时）。
+        #    反击成立的判据（任一）：玩家血量下降（被打）/ 玩家死亡 / 日志击杀记录。
+        #    注意：不要求玩家必须被打死——近战僵尸 DPS 低，玩家可能先把它磨死，
+        #    但只要僵尸对玩家造成了伤害（玩家掉血），就证明反击链已生效。
+        step.info("连续攻击，监控玩家血量判定反击……")
+        log_before = read_client_log()
+        hp0 = _player_hp()  # 战斗开始时玩家血量（基准）
+        deadline = time.time() + TIMEOUT_RETALIATE
+        while time.time() < deadline:
+            # 玩家状态：死亡 or 血量下降 都是反击证据
+            try:
+                st = rpc("player.state", timeout=5)
+            except Exception:
                 break
-        time.sleep(1.2)
+            if "死亡 是" in st or "血量 0.0" in st:
+                retaliated = True
+                step.info(f"玩家被反击致死: {st}")
+                break
+            hp = _parse_hp(st)
+            if hp is not None and hp0 is not None and hp < hp0:
+                retaliated = True
+                step.info(f"玩家被反击掉血 {hp0} → {hp}（反击链生效）: {st}")
+                break
+            # 活着则继续打
+            try:
+                atk = rpc("player.attack", {"target": "zombie"}, timeout=5)
+                step.info(atk)
+            except Exception as e:
+                step.info(f"攻击异常（可能目标已死/走远）: {e}")
+            # 日志侧判定
+            new_log = read_client_log()
+            if new_log != log_before and ("was slain by" in new_log or "was shot by" in new_log):
+                if "was slain by" in new_log[len(log_before):] or "was shot by" in new_log[len(log_before):]:
+                    retaliated = True
+                    break
+            time.sleep(1.2)
 
-    # 8. 判定
-    if not retaliated:
-        # 最后再查一次日志兜底
-        log = read_client_log()
-        if "was slain by" in log or "was shot by" in log:
-            retaliated = True
-
-    stop_client()
+        # 8. 判定前再查一次日志兜底
+        if not retaliated:
+            log = read_client_log()
+            if "was slain by" in log or "was shot by" in log:
+                retaliated = True
+    finally:
+        # 恢复 OP 原状（无论用例成败/中断）：原本是 OP 就恢复回去，原本不是就保持非 OP。
+        if original_op:
+            try:
+                set_op(PLAYER_NAME, True)
+                step.info(f"已恢复 {PLAYER_NAME} 的 OP（还原原状）")
+            except Exception as e:
+                step.info(f"⚠️ OP 恢复失败（需手动检查）: {e}")
+        # 清理客户端（成功/失败路径都经过这里，统一清理）
+        stop_client()
 
     print("=" * 60)
     if retaliated:

@@ -123,11 +123,15 @@ class Rcon:
 
 # ── 密码来源：运行时经 ssh 读一次（不落盘），或环境变量 ─────────────
 
+# 服务端 ssh / 工作目录（读 RCON 密码、ops.json 等服务器文件用）
+DEFAULT_SSH = "dev@127.0.0.1"
+DEFAULT_WORK_DIR = "~/minecraft"
+
 _PASSWORD_CACHE: str | None = None
 
 
-def get_password(ssh_target: str = "dev@127.0.0.1",
-                 work_dir: str = "~/minecraft") -> str:
+def get_password(ssh_target: str = DEFAULT_SSH,
+                 work_dir: str = DEFAULT_WORK_DIR) -> str:
     """取 RCON 密码。优先环境变量 RCON_PASSWORD；否则经 ssh 读一次并缓存。
 
     密码只存在内存，不写入任何文件。
