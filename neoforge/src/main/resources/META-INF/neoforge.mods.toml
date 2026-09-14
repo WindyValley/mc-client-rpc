@@ -1,0 +1,43 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "MIT"
+issueTrackerURL = "https://github.com/WindyValley/mc-client-rpc/issues"
+
+[[mods]]
+modId = "mcclientrpc"
+version = "${version}"
+displayName = "mc-client-rpc"
+authors = "WindyValley"
+displayURL = "https://github.com/WindyValley/mc-client-rpc"
+description = '''
+客户端 JSON-RPC 自动化测试框架。
+
+在客户端进程内开 JSON-RPC TCP 服务，接收外部指令以真实输入驱动
+操控客户端玩家实体（攻击/移动/视角/状态查询），用于真机行为自动化验证。
+
+区别于服务端 RPC 的「伪造伤害来源」，本框架走的是客户端真实输入管线
+（发出真实的攻击/移动包），是「玩家真的在操作」。
+
+⚠️ 测试设施，仅限受信任的本地网络使用。
+'''
+
+[[dependencies.mcclientrpc]]
+modId = "neoforge"
+type = "required"
+versionRange = "[21.1.0,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.mcclientrpc]]
+modId = "minecraft"
+type = "required"
+versionRange = "[1.21.1,1.21.2)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.mcclientrpc]]
+modId = "architectury"
+type = "required"
+versionRange = "[13.0.0,)"
+ordering = "AFTER"
+side = "BOTH"

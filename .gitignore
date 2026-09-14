@@ -1,0 +1,78 @@
+# ───────────── Gradle / 构建产物 ─────────────
+.gradle/
+build/
+out/
+bin/
+!gradle/wrapper/gradle-wrapper.jar
+
+# 正式工程三模块的构建产物
+common/build/
+fabric/build/
+neoforge/build/
+
+# ───────────── Minecraft 运行时 ─────────────
+run/
+runs/
+logs/
+*.log
+crash-reports/
+
+# ───────────── Loom 缓存 ─────────────
+.loom-cache/
+loom-cache/
+remappedSrc/
+
+# ───────────── IDE ─────────────
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+.eclipse/
+
+# ───────────── 系统文件 ─────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ═══════════════════════════════════════════════
+#  spikes/ —— 技术验证目录
+#
+#  分析脚本与结论 JSON 要入库（是设计决策的实证依据），
+#  但 MC jar、mappings、构建缓存共约 187 MB，必须排除。
+#  这些文件可重新下载/生成，不适合进版本库。
+# ═══════════════════════════════════════════════
+
+# MC 原版 jar（约 76 MB）
+spikes/**/*.jar
+spikes/**/server-*.jar
+spikes/**/client-*.jar
+
+# 但 Gradle wrapper jar 必须入库，否则 ./gradlew 不可用
+!spikes/**/gradle/wrapper/gradle-wrapper.jar
+
+# 混淆映射表（约 7.2 MB）
+spikes/**/*mappings*.txt
+spikes/**/*.tsrg
+spikes/**/*.tiny
+
+# bundler 解包产物
+spikes/**/extracted/
+spikes/**/unpacked/
+spikes/**/versions/
+
+# 探针工程的构建产物（约 84 MB）
+spikes/p1-p3-probe/.gradle/
+spikes/p1-p3-probe/build/
+spikes/p1-p3-probe/*/build/
+spikes/p1-p3-probe/*/run/
+spikes/p1-p3-probe/*.log
+
+# Python 缓存
+__pycache__/
+*.pyc
+.venv/
+venv/

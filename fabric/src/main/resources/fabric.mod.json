@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "mcclientrpc",
+  "version": "${version}",
+  "name": "mc-client-rpc",
+  "description": "客户端 JSON-RPC 自动化测试框架：真实输入驱动操控玩家实体，用于真机行为自动化验证。测试设施，仅限受信任网络。",
+  "authors": ["WindyValley"],
+  "contact": {
+    "homepage": "https://github.com/WindyValley/mc-client-rpc",
+    "sources": "https://github.com/WindyValley/mc-client-rpc",
+    "issues": "https://github.com/WindyValley/mc-client-rpc/issues"
+  },
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      {
+        "adapter": "default",
+        "value": "top.windyvalley.mcclientrpc.fabric.McClientRpcFabric"
+      }
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.15.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "architectury": ">=13.0.0"
+  }
+}
