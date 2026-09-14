@@ -27,18 +27,53 @@ Minecraft 客户端 JSON-RPC 自动化测试框架（Architectury 双端：NeoFo
 
 ## RPC 方法
 
+### 进入世界前（自动化导航）
+
+| 方法 | 参数 | 说明 |
+|------|------|------|
+| `client.status` | — | 当前界面/是否进世界/是否连服务器——自动化的「眼睛」 |
+| `client.toTitle` | — | 强制切到主菜单，跳过引导屏（AccessibilityOnboardingScreen 等） |
+| `client.connect` | `host`, `port` | 主动直连服务器（异步，配合 client.status 轮询进世界） |
+| `client.disconnect` | — | 断开连接、回主菜单（测试间重置） |
+
+### 进入世界后（玩家操控）
+
 | 方法 | 参数 | 说明 |
 |------|------|------|
 | `methods.list` | — | 列出所有已注册方法 |
 | `player.pos` | — | 玩家位置/维度/血量 |
-| `player.state` | — | 玩家状态（血量/位置/准星指向/是否地面） |
-| `player.attack` | `target` | 视角对准并攻击最近的指定生物（真实攻击管线） |
+| `player.state` | — | 玩家状态（血量/位置/准星/地面/是否死亡） |
+| `player.respawn` | — | 死亡屏重生（点 DeathScreen 重生按钮的效果） |
+| `player.attack` | `target` | 视角对准并攻击最近的指定生物；带触及守卫（超距报错）+ 命中判定 |
 | `player.look` | `yaw`, `pitch` | 设置视角 |
-| `player.move` | `forward`, `strafe`, `jump` | 设置移动输入（持续，需后续指令清零） |
+| `player.moveToward` | `target` | 自动走向最近目标直到进入触及范围（tick 驱动，到达自动停） |
+| `player.stop` | — | 停止移动 |
+| `player.move` | `forward`, `strafe`, `jump` | 直接设移动输入（注意：会被键盘 tick 覆盖，见下文） |
 | `world.entities` | `radius` | 列出周围生物 |
 
 协议：JSON-RPC 2.0，每行一个请求。成功返回 `result`，失败返回 `error:{code,message}`
 （-32700 解析失败 / -32600 缺 method / -32601 未知方法 / -32603 业务异常）。
+
+### 已踩过的坑（实现要点）
+
+- **拦路界面**：dev 环境启动先弹 `AccessibilityOnboardingScreen`（无障碍引导屏），挡在
+  TitleScreen 前，导致 `--quickPlayMultiplayer` 失效、无法连接。必须先 `client.toTitle` 跳过。
+  死亡后 `DeathScreen` 同样挡操控，需 `player.respawn`。
+- **移动模拟**：直接改 `player.input.forwardImpulse` 字段无效——`KeyboardInput.tick()` 每帧
+  从键盘覆盖。`moveToward` 改用 `setDeltaMovement` 在 tick 里朝目标推进（真实位移包，
+  非瞬移），到达触及距离自动停。若需更拟真的走路（脚步声/动画），可上 OS 级按键模拟
+  （系统窗口消息发 W/A/S/D，让 KeyboardInput 当真实键盘）——建议放测试脚本侧而非 mod 内。
+- **触及距离**：`player.attack` 超出生存触及范围（约 3 格，`entityInteractionRange()`）时
+  服务端判挥空不掉血。已加守卫，超距直接报错提示先 moveToward 走近。
+- **客户端血量判定不可靠**：`gameMode.attack` 发包后客户端本地血量不即时更新，
+  「命中判定」应以服务端权威结果为准（如玩家被反击掉血/死亡）。
+
+### 真机验证结论（2026-09-14）
+
+完整闭环已跑通：启动 → `client.status`（引导屏）→ `client.toTitle` → `client.connect`
+→ 进世界 → `player.respawn` → `player.moveToward`（10.5 格→2.0 格）→ `player.attack`
+→ **掠夺者反击将玩家打死**（血量 20→0）。证明客户端真实输入攻击命中 + 中立化生物
+反击链正常，全程无人工点界面。
 
 ## 调用示例
 
