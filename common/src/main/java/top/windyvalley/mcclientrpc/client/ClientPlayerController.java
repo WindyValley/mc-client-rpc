@@ -146,6 +146,8 @@ public final class ClientPlayerController {
         d.register("player.stop", p -> submitOnClientThread(this::stopMove, 3000));
         d.register("player.state", p -> submitOnClientThread(this::playerState, 3000));
         d.register("player.respawn", p -> submitOnClientThread(this::respawn, 3000));
+        d.register("player.command", p -> submitOnClientThread(() -> sendCommand(str(p, "cmd", "")), 3000));
+        d.register("player.chat", p -> submitOnClientThread(() -> sendChat(str(p, "msg", "")), 3000));
         d.register("world.entities", p -> submitOnClientThread(
                 () -> listEntities(f(p, "radius", 32)), 3000));
     }
@@ -259,6 +261,39 @@ public final class ClientPlayerController {
         // 等价于点 DeathScreen 的「重生」按钮：内部发 ServerboundClientCommandPacket
         p.respawn();
         return "已重生";
+    }
+
+    /**
+     * 以玩家身份发送一条指令（等价于在聊天框输入 /xxx 回车）。
+     *
+     * <p>走真实聊天指令管线：发 {@code ServerboundChatCommandPacket}，
+     * 服务端按该玩家权限执行。因此可执行的指令取决于玩家权限——
+     * 普通玩家只能 /me、/msg 等；OP(等级≥2)才能 /summon、/gamemode 等。
+     * 测试脚本可用 RCON 先 op 再由此发指令（见 combat_loop_test）。
+     *
+     * @param cmd 不带前导 / 的指令，如 "summon zombie 0 -60 0"
+     */
+    private String sendCommand(String cmd) {
+        LocalPlayer p = requirePlayer();
+        if (cmd == null || cmd.isBlank()) {
+            return "错误: 缺少 cmd 参数";
+        }
+        String c = cmd.startsWith("/") ? cmd.substring(1) : cmd;
+        p.connection.sendCommand(c);
+        return "已发送指令 /" + c;
+    }
+
+    /**
+     * 以玩家身份发送一条普通聊天（等价于聊天框打字回车）。
+     * 走真实聊天管线：发 ServerboundChatPacket。
+     */
+    private String sendChat(String msg) {
+        LocalPlayer p = requirePlayer();
+        if (msg == null || msg.isBlank()) {
+            return "错误: 缺少 msg 参数";
+        }
+        p.connection.sendChat(msg);
+        return "已发送聊天: " + msg;
     }
 
     /**

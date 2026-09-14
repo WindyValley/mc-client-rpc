@@ -11,11 +11,16 @@ mc-client-rpc 战斗闭环回归测试
   2. client.toTitle —— 跳过无障碍引导屏（dev 环境拦路界面）
   3. client.connect → 轮询「已进世界=true」
   4. player.respawn（若死亡）→ player.state 确认活着满血
-  5. 服务端 RCON 在远处召唤僵尸
+  5. 召唤僵尸：RCON 临时授 OP → 客户端 player.command 发 /summon → 立即 deop
   6. world.entities 确认僵尸进入视野
-  7. player.moveToward → 轮询进入攻击触及范围
+  7. player.moveToward → 轮询进入攻击触及范围（此刻已是普通玩家身份）
   8. player.attack —— 触及范围内真实命中
   9. 验证反击：玩家掉血/死亡（服务端权威）或客户端日志出现击杀记录
+
+OP 权限管理（测试可控前置条件）：
+  - 仅 /summon 需要 OP，用 RCON 临时授予，召完立即 deop 还原普通玩家
+  - 反击验证全程以普通玩家身份进行（OP 被打行为可能不同，会偏离真实场景）
+  - 无论用例成败，OP 变更都在 finally 中移除，不污染服务器
 
 判定「反击生效」的权威信号（三重，任一命中即算）：
   - player.state 血量下降或「死亡 是」
@@ -23,7 +28,7 @@ mc-client-rpc 战斗闭环回归测试
 
 退出码：0=闭环通过，非 0=某步失败（ stdout 已指明步骤）。
 
-依赖：仅标准库 + 能 ssh 到测试服（召唤生物用）。无第三方包。
+依赖：仅标准库 + 服务端 RCON 直连可达（scripts/rcon.py）。无第三方包。
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ RPC_PORT = 25586
 # 测试服务器（召唤生物用，本机直连 RCON，不绕 ssh）
 SERVER_HOST = "127.0.0.1"
 SERVER_RCON_PORT = 25575
+PLAYER_NAME = "Dev"                # 测试玩家名（OP 授权/指令作用对象）
 SUMMON_MOB = "minecraft:zombie"      # 用于测反击的中立化生物
 SUMMON_DIST = 10.0                   # 召唤在玩家多少格外（需 > 触及 3 格）
 
@@ -131,6 +137,20 @@ def server_rcon(command: str) -> str:
     import rcon  # scripts/rcon.py
     with rcon.open_default(SERVER_HOST, SERVER_RCON_PORT) as r:
         return r.command(command)
+
+
+# ── OP 权限生命周期管理 ─────────────────────────────────────────────
+#
+# OP 是测试的可控前置条件，由脚本全权管理：
+#   - 需要 OP 的用例（如 /summon）：开头 op，退出时 deop（finally 保证）
+#   - 需要普通玩家的用例（如反击/权限校验）：开头先 deop（Dev 可能本来就有 OP）
+# 无论用例成功/失败/中断，OP 变更都应在脚本退出时还原，不污染服务器。
+
+
+def set_op(player: str, on: bool) -> None:
+    """授予/移除玩家 OP（经 RCON，与玩家是否在线无关，脱机也生效）。"""
+    cmd = f"op {player}" if on else f"deop {player}"
+    server_rcon(cmd)
 
 
 def read_client_log() -> str:
@@ -274,11 +294,23 @@ def main() -> int:
         raise step.fail("重生后仍死亡")
     step.ok(f"玩家存活: {state}")
 
-    # 4. 在远处召唤僵尸（服务端 RCON）
-    summon = server_rcon(
-        f"execute at Dev run summon {SUMMON_MOB} ~{SUMMON_DIST} ~ ~ {{PersistenceRequired:1b}}"
-    )
-    step.ok(f"服务端召唤 {SUMMON_MOB}（{SUMMON_DIST} 格外）: {summon or '(无回显)'}")
+    # 4. 召唤僵尸：仅这一步需要 OP（/summon），召完立即 deop。
+    #    反击验证（步骤6-8）要求玩家是普通身份——OP 被打行为可能不同，
+    #    也偏离「普通玩家被反击」的真实场景。故 OP 生命周期严格限定在召唤内。
+    set_op(PLAYER_NAME, True)
+    step.info(f"已通过 RCON 授予 {PLAYER_NAME} OP（仅用于 /summon）")
+    try:
+        summon = rpc("player.command", {
+            "cmd": f"execute at {PLAYER_NAME} run summon {SUMMON_MOB} ~{SUMMON_DIST} ~ ~ {{PersistenceRequired:1b}}"
+        })
+        step.ok(f"客户端指令召唤 {SUMMON_MOB}（{SUMMON_DIST} 格外）: {summon}")
+    finally:
+        # 召完立即移除 OP：后续走近/攻击/被反击都以普通玩家身份进行。
+        try:
+            set_op(PLAYER_NAME, False)
+            step.info(f"已移除 {PLAYER_NAME} OP（还原为普通玩家）")
+        except Exception as e:
+            step.info(f"⚠️ OP 移除失败（需手动检查）: {e}")
     time.sleep(1.5)
 
     # 5. 确认僵尸进入视野
@@ -288,7 +320,7 @@ def main() -> int:
         raise step.fail(f"召唤后视野内无 zombie: {ents}")
     step.ok(f"视野内确认目标: {ents.strip().splitlines()[-1] if ents.strip() else ents}")
 
-    # 6. moveToward 走近 → 轮询进入触及范围
+    # 6. moveToward 走近 → 轮询进入触及范围（此刻玩家已是普通身份）
     rpc("player.moveToward", {"target": "zombie"})
 
     def _in_reach():
