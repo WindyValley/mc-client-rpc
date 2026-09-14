@@ -2,6 +2,11 @@ package top.windyvalley.mcclientrpc.client;
 
 import com.google.gson.JsonObject;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.ConnectScreen;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.gui.screens.TitleScreen;
+import net.minecraft.client.multiplayer.ServerData;
+import net.minecraft.client.multiplayer.resolver.ServerAddress;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
@@ -89,6 +94,15 @@ public final class ClientPlayerController {
     /** 把全部 RPC 方法注册到分发器。 */
     public void registerHandlers(RpcDispatcher d) {
         d.register("methods.list", p -> String.join(", ", d.methods()));
+
+        // ── 进入世界前（自动化导航）──
+        d.register("client.status", p -> submitOnClientThread(this::clientStatus, 3000));
+        d.register("client.toTitle", p -> submitOnClientThread(this::toTitle, 3000));
+        d.register("client.connect", p -> submitOnClientThread(
+                () -> connect(str(p, "host", "127.0.0.1"), (int) f(p, "port", 25565)), 8000));
+        d.register("client.disconnect", p -> submitOnClientThread(this::disconnect, 3000));
+
+        // ── 进入世界后（玩家操控）──
         d.register("player.pos", p -> submitOnClientThread(this::playerPos, 3000));
         d.register("player.attack", p -> submitOnClientThread(() -> attackNearest(str(p, "target", "zombie")), 5000));
         d.register("player.look", p -> submitOnClientThread(
@@ -96,8 +110,85 @@ public final class ClientPlayerController {
         d.register("player.move", p -> submitOnClientThread(
                 () -> move(f(p, "forward", 0), f(p, "strafe", 0), bool(p, "jump", false)), 3000));
         d.register("player.state", p -> submitOnClientThread(this::playerState, 3000));
+        d.register("player.respawn", p -> submitOnClientThread(this::respawn, 3000));
         d.register("world.entities", p -> submitOnClientThread(
                 () -> listEntities(f(p, "radius", 32)), 3000));
+    }
+
+    // ── 进入世界前：自动化导航 ─────────────────────────────────────
+
+    /**
+     * 客户端当前状态 —— 自动化的「眼睛」。
+     *
+     * <p>报告当前在哪个界面（主菜单/连接中/已进世界）、玩家是否就绪，
+     * 让外部脚本能判断「现在能不能发 player.* 指令」。
+     */
+    private String clientStatus() {
+        String screen = mc.screen == null ? "无界面(游戏中)" : mc.screen.getClass().getSimpleName();
+        boolean inWorld = mc.player != null && mc.level != null;
+        boolean connected = mc.getConnection() != null && mc.getConnection().getConnection().isConnected();
+        String server = connected && mc.getCurrentServer() != null ? mc.getCurrentServer().ip : "无";
+        return String.format("界面=%s | 已进世界=%s | 已连服务器=%s | 服务器=%s",
+                screen, inWorld, connected, server);
+    }
+
+    /**
+     * 强制切到主菜单 —— 跳过拦路的引导界面。
+     *
+     * <p>dev 环境首次启动会停在 {@code AccessibilityOnboardingScreen}
+     * （无障碍引导），它挡在 TitleScreen 之前，导致 quickPlay 不触发、
+     * 也无法直接连接。本方法无条件 setScreen(TitleScreen)，把所有
+     * 引导/确认界面一次性关掉。connect 前会自动调用它。
+     */
+    private String toTitle() {
+        String before = mc.screen == null ? "无" : mc.screen.getClass().getSimpleName();
+        mc.setScreen(new TitleScreen());
+        return "已从 " + before + " 切到 TitleScreen";
+    }
+
+    /**
+     * 直连服务器 —— 绕过 quickPlay 失效，主动发起连接。
+     *
+     * <p>走官方 {@link ConnectScreen#startConnecting} 路径，等价于玩家
+     * 在多人游戏列表点「加入服务器」。连接是异步的：本方法发起后立即返回，
+     * 进世界需几秒，外部用 client.status 轮询「已进世界=true」再发 player.*。
+     *
+     * <p>连接前先强制回主菜单，避免被无障碍引导等界面挡住。
+     */
+    private String connect(String host, int port) {
+        if (mc.player != null) {
+            return "已在世界中（" + (mc.getCurrentServer() != null ? mc.getCurrentServer().ip : "?")
+                    + "），先 client.disconnect 再连";
+        }
+        // 先确保在主菜单：无障碍引导屏(AccessibilityOnboardingScreen)等会挡住连接流程
+        mc.setScreen(new TitleScreen());
+
+        String address = host + ":" + port;
+        ServerAddress serverAddress = ServerAddress.parseString(address);
+        // ServerData: name/ip/type。type 用 OTHER，不存进服务器列表。
+        ServerData serverData = new ServerData("mcrpc-" + host, address, ServerData.Type.OTHER);
+        // parent 用 TitleScreen：连接界面叠加其上，断开时自然回到主菜单。
+        ConnectScreen.startConnecting(new TitleScreen(), mc, serverAddress, serverData, false, null);
+        return "已发起连接 " + address + "（异步，用 client.status 轮询进世界）";
+    }
+
+    /**
+     * 断开连接、回主菜单 —— 测试间重置。
+     */
+    private String disconnect() {
+        if (mc.level == null) {
+            return "本就不在世界中";
+        }
+        boolean wasMultiplayer = mc.getConnection() != null;
+        if (mc.level != null) {
+            mc.level.disconnect();
+        }
+        if (wasMultiplayer) {
+            mc.disconnect(new TitleScreen(), false);
+        } else {
+            mc.disconnect(new TitleScreen(), false);
+        }
+        return "已断开，回主菜单";
     }
 
     // ── 操控实现（都在 render thread 执行）─────────────────────────
@@ -111,11 +202,28 @@ public final class ClientPlayerController {
 
     private String playerState() {
         LocalPlayer p = requirePlayer();
-        return String.format("玩家 %s | 血量 %.1f/%.1f | 位置 (%.1f,%.1f,%.1f) | 准星指向 %s | 地面 %s",
+        return String.format("玩家 %s | 血量 %.1f/%.1f | 位置 (%.1f,%.1f,%.1f) | 准星指向 %s | 地面 %s | 死亡 %s",
                 p.getName().getString(), p.getHealth(), p.getMaxHealth(),
                 p.getX(), p.getY(), p.getZ(),
                 mc.hitResult == null ? "无" : mc.hitResult.getType(),
-                p.onGround() ? "是" : "否");
+                p.onGround() ? "是" : "否",
+                p.isDeadOrDying() ? "是(需respawn)" : "否");
+    }
+
+    /**
+     * 重生 —— 死亡界面(DeathScreen)挡操控时点击「重生」按钮的效果。
+     *
+     * <p>玩家死亡后停在 DeathScreen，所有 player.* 操控都被挡住。
+     * 本方法等价于点重生按钮：发 ServerboundClientCommandPacket(PERFORM_RESPAWN)。
+     */
+    private String respawn() {
+        LocalPlayer p = requirePlayer();
+        if (!p.isDeadOrDying()) {
+            return "玩家未死亡，无需重生";
+        }
+        // 等价于点 DeathScreen 的「重生」按钮：内部发 ServerboundClientCommandPacket
+        p.respawn();
+        return "已重生";
     }
 
     /**
