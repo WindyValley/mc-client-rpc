@@ -53,6 +53,9 @@ public final class ClientPlayerController {
 
     private final Minecraft mc = Minecraft.getInstance();
 
+    /** 持续移动目标：非空时 tick() 每帧朝它前进并瞄准，跑赢 input.tick() 的键盘覆盖。 */
+    private volatile Entity moveTarget;
+
     /**
      * 提交一个任务到 render thread 执行，阻塞等待结果。
      *
@@ -81,12 +84,41 @@ public final class ClientPlayerController {
      * <p>由平台层 ClientTickEvent 每帧调用。
      */
     public void tick() {
+        // 1. 消费 RPC 任务队列（render thread 执行 MC 操控）
         ClientTask task;
         while ((task = queue.poll()) != null) {
             try {
                 task.future().complete(task.action().get());
             } catch (Throwable t) {
                 task.future().completeExceptionally(t);
+            }
+        }
+
+        // 2. 持续移动：有激活目标时每帧朝它推进。
+        //    直接改 input 字段无效——KeyboardInput.tick() 每帧开头从键盘覆盖
+        //    forwardImpulse/leftImpulse（试过 CLIENT_POST 重设仍被下一帧清掉）。
+        //    改用 setDeltaMovement 朝目标推进：产生真实的玩家位移包
+        //    (ServerboundMovePlayerPacket)，服务端照常更新位置+校验触及距离，
+        //    移动本身是真实网络位移，不是服务端伪造坐标。
+        Entity target = moveTarget;
+        LocalPlayer p = mc.player;
+        if (target != null && p != null) {
+            if (!target.isAlive() || p.distanceTo(target) <= p.entityInteractionRange() - 0.2) {
+                // 到达或目标消失：停止
+                moveTarget = null;
+                p.setDeltaMovement(p.getDeltaMovement().x * 0.5, p.getDeltaMovement().y,
+                        p.getDeltaMovement().z * 0.5);
+            } else {
+                // 朝目标方向推进（保留 y 速度让重力/跳跃正常）
+                aimAt(p, target);
+                double dx = target.getX() - p.getX();
+                double dz = target.getZ() - p.getZ();
+                double len = Math.sqrt(dx * dx + dz * dz);
+                if (len > 1.0e-4) {
+                    double speed = 0.22; // 约等于玩家疾走水平速度（格/tick）
+                    p.setDeltaMovement(dx / len * speed, p.getDeltaMovement().y, dz / len * speed);
+                    p.hurtMarked = true; // 触发位移同步
+                }
             }
         }
     }
@@ -109,6 +141,9 @@ public final class ClientPlayerController {
                 () -> look(f(p, "yaw", 0), f(p, "pitch", 0)), 3000));
         d.register("player.move", p -> submitOnClientThread(
                 () -> move(f(p, "forward", 0), f(p, "strafe", 0), bool(p, "jump", false)), 3000));
+        d.register("player.moveToward", p -> submitOnClientThread(
+                () -> moveToward(str(p, "target", "zombie")), 3000));
+        d.register("player.stop", p -> submitOnClientThread(this::stopMove, 3000));
         d.register("player.state", p -> submitOnClientThread(this::playerState, 3000));
         d.register("player.respawn", p -> submitOnClientThread(this::respawn, 3000));
         d.register("world.entities", p -> submitOnClientThread(
@@ -242,13 +277,31 @@ public final class ClientPlayerController {
         if (mc.gameMode == null) {
             return "错误: gameMode 未就绪（不在多人游戏？）";
         }
+        double dist = p.distanceTo(target);
+        // 触及距离守卫：生存模式玩家触及约 3 格（实体判定 + 服务端校验）。
+        // 超出时服务端会判定挥空，攻击包发了但不掉血——此前「打了不掉血」即此因。
+        double reach = p.entityInteractionRange(); // 玩家实体触及距离（属性系统，生存默认3格）
+        if (dist > reach) {
+            return String.format("错误: %s 距离 %.1f 格，超出触及范围 %.1f 格——需先 player.move 走近",
+                    target.getType().toString(), dist, reach);
+        }
+        // 攻击前血量（LivingEntity 才有，用于命中判定）
+        Float hpBefore = target instanceof net.minecraft.world.entity.LivingEntity le
+                ? le.getHealth() : null;
         // 视角对准目标（真实玩家会先瞄准）
         aimAt(p, target);
         // 真实攻击：走客户端攻击管线 → 发攻击包 → 服务端判定
         mc.gameMode.attack(p, target);
         p.swing(InteractionHand.MAIN_HAND);
-        return String.format("已攻击 %s (距离 %.1f 格) —— 真实输入路径",
-                target.getType().toString(), p.distanceTo(target));
+        // 命中判定：客户端预测血量（服务端权威，客户端血量稍后同步）
+        Float hpAfter = target instanceof net.minecraft.world.entity.LivingEntity le2
+                ? le2.getHealth() : null;
+        String hitInfo = (hpBefore != null && hpAfter != null)
+                ? String.format(" 血量 %.1f→%.1f %s", hpBefore, hpAfter,
+                        hpAfter < hpBefore ? "(已命中)" : "(未掉血-可能挥空/无敌帧)")
+                : "";
+        return String.format("已攻击 %s (距离 %.1f 格) —— 真实输入路径%s",
+                target.getType().toString(), dist, hitInfo);
     }
 
     private String look(float yaw, float pitch) {
@@ -266,8 +319,44 @@ public final class ClientPlayerController {
         p.input.forwardImpulse = forward;
         p.input.leftImpulse = strafe;
         p.input.jumping = jump;
-        return String.format("移动输入已设 forward=%.2f strafe=%.2f jump=%s（持续，需后续指令清零）",
+        return String.format("移动输入已设 forward=%.2f strafe=%.2f jump=%s（持续，需后续 player.stop 清零）",
                 forward, strafe, jump);
+    }
+
+    /**
+     * 自动走向最近的指定生物，直到进入攻击触及范围。
+     *
+     * <p>朝目标持续前进（forward=1）并把视角对准它。移动是逐帧模拟按键，
+     * 到达触及距离后自动停下。闭环自动化的关键：找怪 → moveToward 走近 → attack 命中。
+     */
+    private String moveToward(String typeKey) {
+        LocalPlayer p = requirePlayer();
+        Entity target = nearestEntity(p, typeKey, 32.0);
+        if (target == null) {
+            return "错误: 附近 32 格内无 " + typeKey;
+        }
+        double reach = p.entityInteractionRange();
+        double dist = p.distanceTo(target);
+        if (dist <= reach - 0.3) {
+            return String.format("已在触及范围内（%.1f 格），无需移动", dist);
+        }
+        // 设持续移动目标，由 tick() 每帧驱动前进+瞄准（跑赢键盘覆盖），
+        // 到达触及距离后 tick 自动停止。这是真实走路（发移动包），不是瞬移。
+        moveTarget = target;
+        return String.format("开始走向 %s（当前 %.1f 格，触及 %.1f 格）——tick 驱动，到达自动停",
+                target.getType().toString(), dist, reach);
+    }
+
+    /** 停止移动（清持续目标 + 清零输入）。 */
+    private String stopMove() {
+        moveTarget = null;
+        LocalPlayer p = requirePlayer();
+        if (p.input != null) {
+            p.input.forwardImpulse = 0f;
+            p.input.leftImpulse = 0f;
+            p.input.jumping = false;
+        }
+        return "移动已停止";
     }
 
     private String listEntities(float radius) {
