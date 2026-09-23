@@ -76,3 +76,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# ───────────── 临时脚本目录 ─────────────
+# 一次性/调试用脚本放 scripts/_temp/，不入库
+scripts/_temp/
