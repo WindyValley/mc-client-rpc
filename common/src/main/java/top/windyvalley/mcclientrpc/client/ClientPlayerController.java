@@ -1,6 +1,7 @@
 package top.windyvalley.mcclientrpc.client;
 
 import com.google.gson.JsonObject;
+import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.ConnectScreen;
 import net.minecraft.client.gui.screens.Screen;
@@ -56,6 +57,11 @@ public final class ClientPlayerController {
     /** 持续移动目标：非空时 tick() 每帧朝它前进并瞄准，跑赢 input.tick() 的键盘覆盖。 */
     private volatile Entity moveTarget;
 
+    /** 攻击目标：非空时 tick() 每帧检查距离,远了 moveToward,近了 attack 并 complete future。 */
+    private volatile Entity attackTarget;
+    /** 攻击完成回调:tick() 里 attack 后 complete。 */
+    private volatile CompletableFuture<Object> attackFuture;
+
     /**
      * 提交一个任务到 render thread 执行，阻塞等待结果。
      *
@@ -103,8 +109,10 @@ public final class ClientPlayerController {
         Entity target = moveTarget;
         LocalPlayer p = mc.player;
         if (target != null && p != null) {
-            if (!target.isAlive() || p.distanceTo(target) <= p.entityInteractionRange() - 0.2) {
-                // 到达或目标消失：停止
+            // 注意:moveTarget 的「到达」条件要比 attackTarget 的「触及」更严格(reach - 0.5),
+            // 否则 moveTarget 提前停,attackTarget 永远到不了触及范围。
+            if (!target.isAlive() || p.distanceTo(target) <= p.entityInteractionRange() - 0.5) {
+                // 到达或目标消失:停止
                 moveTarget = null;
                 p.setDeltaMovement(p.getDeltaMovement().x * 0.5, p.getDeltaMovement().y,
                         p.getDeltaMovement().z * 0.5);
@@ -121,6 +129,39 @@ public final class ClientPlayerController {
                 }
             }
         }
+
+        // 3. 攻击目标:tick() 每帧检查距离,远了 moveToward,近了 attack 并 complete future。
+        //    参考怪物 MeleeAttackGoal 的设计:持续 tick 驱动,触及内+视线通才攻击。
+        Entity atkTarget = attackTarget;
+        CompletableFuture<Object> atkFuture = attackFuture;
+        if (atkTarget != null && atkFuture != null && p != null) {
+            if (!atkTarget.isAlive()) {
+                atkFuture.complete("错误: 目标已死亡");
+                attackTarget = null;
+                attackFuture = null;
+            } else {
+                double dist = p.distanceTo(atkTarget);
+                double reach = p.entityInteractionRange();
+                if (dist <= reach - 0.2) {
+                    // 到达触及范围:瞄准 + 攻击 + 挥臂
+                    aimAt(p, atkTarget);
+                    if (mc.gameMode != null) {
+                        mc.gameMode.attack(p, atkTarget);
+                        p.swing(InteractionHand.MAIN_HAND);
+                        atkFuture.complete(String.format("已攻击 %s (距离 %.1f 格) —— 真实输入路径",
+                                atkTarget.getType().toString(), dist));
+                    } else {
+                        atkFuture.complete("错误: gameMode 未就绪");
+                    }
+                    attackTarget = null;
+                    attackFuture = null;
+                    moveTarget = null; // 停止移动
+                } else {
+                    // 继续 moveToward(设 moveTarget,让上面的逻辑推进)
+                    moveTarget = atkTarget;
+                }
+            }
+        }
     }
 
     /** 把全部 RPC 方法注册到分发器。 */
@@ -133,14 +174,62 @@ public final class ClientPlayerController {
         d.register("client.connect", p -> submitOnClientThread(
                 () -> connect(str(p, "host", "127.0.0.1"), (int) f(p, "port", 25565)), 8000));
         d.register("client.disconnect", p -> submitOnClientThread(this::disconnect, 3000));
+        // 完全退出客户端进程（等价标题屏「退出」按钮 → Minecraft.destroy → System.exit）。
+        // 不走 submitOnClientThread：destroy 会终止 JVM，阻塞等 future 永远等不到。
+        // 立即返回应答，500ms 后在 render thread 执行 destroy（留时间把响应写回 socket）。
+        d.register("client.quit", p -> quitGame());
 
         // ── 进入世界后（玩家操控）──
         d.register("player.pos", p -> submitOnClientThread(this::playerPos, 3000));
         d.register("player.attack", p -> submitOnClientThread(() -> attackNearest(str(p, "target", "zombie")), 5000));
+        // 高级指令:自动寻路到目标 → 进入触及范围 → 攻击(参考怪物 MeleeAttackGoal)
+        // 注意:不能用 submitOnClientThread 里阻塞 future.get()——那会卡死 render thread,
+        // tick() 的 attackTarget 处理永远没机会跑(死锁)。
+        // 正确做法:RPC 线程上阻塞,先提交一个瞬间完成的「设置目标」任务,
+        // render thread 继续 tick 处理寻路+攻击,完成后 complete attackFuture。
+        d.register("player.attackNearest", p -> {
+            String typeKey = str(p, "target", "zombie");
+            CompletableFuture<Object> attackFuture = new CompletableFuture<>();
+            CompletableFuture<Object> setupFuture = new CompletableFuture<>();
+            // 快速任务:在 render thread 设置 attackTarget(瞬间完成)
+            queue.add(new ClientTask(() -> {
+                attackNearestAsync(typeKey, attackFuture);
+                return "已锁定目标";
+            }, setupFuture));
+            // 等设置任务跑完(确认目标找到)
+            try {
+                setupFuture.get(5, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                attackTarget = null;
+                attackFuture.complete("错误: 设置攻击目标失败: " + e.getMessage());
+            }
+            // RPC 线程上阻塞等结果(render thread 不阻塞,继续 tick)
+            try {
+                return attackFuture.get(15000, TimeUnit.MILLISECONDS);
+            } catch (TimeoutException e) {
+                // 超时清理状态,避免卡死
+                queue.add(new ClientTask(() -> {
+                    attackTarget = null; moveTarget = null;
+                    return null;
+                }, new CompletableFuture<>()));
+                attackTarget = null;
+                return "错误: 攻击超时(15s)——可能目标太远/找不到路径";
+            } catch (ExecutionException e) {
+                attackTarget = null;
+                Throwable cause = e.getCause() == null ? e : e.getCause();
+                return "错误: " + cause.getClass().getSimpleName() + ": " + cause.getMessage();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                attackTarget = null;
+                return "错误: 等待被中断";
+            }
+        });
         d.register("player.look", p -> submitOnClientThread(
                 () -> look(f(p, "yaw", 0), f(p, "pitch", 0)), 3000));
         d.register("player.move", p -> submitOnClientThread(
                 () -> move(f(p, "forward", 0), f(p, "strafe", 0), bool(p, "jump", false)), 3000));
+        d.register("player.jump", p -> submitOnClientThread(
+                () -> setJumpKey(bool(p, "down", true)), 3000));
         d.register("player.moveToward", p -> submitOnClientThread(
                 () -> moveToward(str(p, "target", "zombie")), 3000));
         d.register("player.stop", p -> submitOnClientThread(this::stopMove, 3000));
@@ -228,6 +317,38 @@ public final class ClientPlayerController {
         return "已断开，回主菜单";
     }
 
+    /**
+     * 退出整个客户端进程（标题屏「退出」按钮的效果）。
+     *
+     * <p><b>不能</b>用 {@link #submitOnClientThread}：{@code Minecraft.destroy()}
+     * 末尾会 {@code System.exit(0)}，在 render thread 同步执行时，RPC 应答还没
+     * 写回 socket 进程就没了，调用方只会收到连接断开。因此立即返回应答，另起
+     * daemon 线程延迟 {@value #QUIT_DELAY_MS}ms（留出响应发送时间），再用
+     * {@code mc.execute} 切回 render thread 调 destroy（MC 状态只能在主线程动）。
+     */
+    private static final long QUIT_DELAY_MS = 500;
+
+    private String quitGame() {
+        Thread t = new Thread(() -> {
+            try {
+                Thread.sleep(QUIT_DELAY_MS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            mc.execute(() -> {
+                try {
+                    mc.destroy();
+                } finally {
+                    // destroy 在异常路径下可能不退出，兜底保证进程终止
+                    Runtime.getRuntime().halt(0);
+                }
+            });
+        }, "mc-client-rpc-quit");
+        t.setDaemon(true);
+        t.start();
+        return "客户端将在 " + QUIT_DELAY_MS + "ms 后退出";
+    }
+
     // ── 操控实现（都在 render thread 执行）─────────────────────────
 
     private String playerPos() {
@@ -297,6 +418,32 @@ public final class ClientPlayerController {
     }
 
     /**
+     * 高级指令:自动寻路到目标 → 进入触及范围 → 攻击。
+     *
+     * <p>参考怪物 {@code MeleeAttackGoal} 的设计:持续 tick 驱动,
+     * 触及内+视线通才攻击。与 {@link #attackNearest} 的区别:
+     * <ul>
+     *   <li>{@code attackNearest}:一次性,距离远直接报错,需调用方先 moveToward</li>
+     *   <li>{@code attackNearestAsync}:自动寻路,tick 里循环检查距离,
+     *       到达触及范围后自动攻击,结果经 future 异步返回</li>
+     * </ul>
+     *
+     * <p>实现:设 {@link #attackTarget} + {@link #attackFuture},
+     * tick() 里每帧检查距离,远了 moveToward,近了 attack 并 complete future。
+     */
+    private void attackNearestAsync(String typeKey, CompletableFuture<Object> future) {
+        LocalPlayer p = requirePlayer();
+        Entity target = nearestEntity(p, typeKey, 32.0);
+        if (target == null) {
+            future.complete("错误: 附近 32 格内无 " + typeKey);
+            return;
+        }
+        // 设攻击目标,tick() 里循环处理(远了 moveToward,近了 attack)
+        attackTarget = target;
+        attackFuture = future;
+    }
+
+    /**
      * 攻击最近的指定类型生物 —— 真实输入路径。
      *
      * <p>先把视角对准目标，再调 {@code mc.gameMode.attack(player, entity)}
@@ -348,14 +495,37 @@ public final class ClientPlayerController {
 
     private String move(float forward, float strafe, boolean jump) {
         LocalPlayer p = requirePlayer();
-        if (p.input == null) {
-            return "错误: input 未就绪";
-        }
-        p.input.forwardImpulse = forward;
-        p.input.leftImpulse = strafe;
-        p.input.jumping = jump;
-        return String.format("移动输入已设 forward=%.2f strafe=%.2f jump=%s（持续，需后续 player.stop 清零）",
+        // 直接设 input.forwardImpulse 会被 KeyboardInput.tick() 下一帧按键映射
+        // 重算覆盖（实测玩家不动，z 恒定），且不在正常输入链上、易丢移动包。
+        // 与跳跃同理：改为按下/释放方向键映射，由原版 tick 自然驱动并发包。
+        var o = Minecraft.getInstance().options;
+        o.keyUp.setDown(forward > 0.01f);
+        o.keyDown.setDown(forward < -0.01f);
+        o.keyLeft.setDown(strafe > 0.01f);
+        o.keyRight.setDown(strafe < -0.01f);
+        o.keyJump.setDown(jump);
+        return String.format("移动键已设 forward=%.2f strafe=%.2f jump=%s（原版 tick 驱动发包，需 player.stop 释放）",
                 forward, strafe, jump);
+    }
+
+    /**
+     * 按下 / 释放跳跃键映射 {@code Minecraft.options.keyJump}。
+     *
+     * <p>为什么不能直接调 {@code jumpFromGround()}（实测过）：直接调用发生在正常
+     * tick 循环之外，客户端只做了本地预测离地，<b>不发位置包</b>，等下一帧正常
+     * tick 发包时玩家已落地，服务端从头到尾没看到这次跳跃，于是服务端不产生
+     * 落地振动，尖啸体（服务端监听者）收不到（实测 y 抬到 -55.8 但 listener 恒 -1）。
+     *
+     * <p>真实按空格走的是：{@code KeyboardInput.tick()} 读 {@code keyJump.isDown()}
+     * 设 {@code input.jumping} → {@code LocalPlayer.aiStep()} 起跳并发位置包 →
+     * 服务端看到跳跃和落地、广播落地振动。故这里直接置按键映射的按下状态，
+     * 让原版整条链路（含发包）自然发生。
+     */
+    private String setJumpKey(boolean down) {
+        LocalPlayer p = requirePlayer();
+        KeyMapping keyJump = Minecraft.getInstance().options.keyJump;
+        keyJump.setDown(down);
+        return String.format("跳跃键 %s（将由原版 tick 起跳并发包）", down ? "按下" : "释放");
     }
 
     /**
@@ -382,15 +552,15 @@ public final class ClientPlayerController {
                 target.getType().toString(), dist, reach);
     }
 
-    /** 停止移动（清持续目标 + 清零输入）。 */
+    /** 停止移动（清持续目标 + 释放方向/跳跃键映射）。 */
     private String stopMove() {
         moveTarget = null;
-        LocalPlayer p = requirePlayer();
-        if (p.input != null) {
-            p.input.forwardImpulse = 0f;
-            p.input.leftImpulse = 0f;
-            p.input.jumping = false;
-        }
+        var o = Minecraft.getInstance().options;
+        o.keyUp.setDown(false);
+        o.keyDown.setDown(false);
+        o.keyLeft.setDown(false);
+        o.keyRight.setDown(false);
+        o.keyJump.setDown(false);
         return "移动已停止";
     }
 

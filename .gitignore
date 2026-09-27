@@ -80,3 +80,8 @@ venv/
 # ───────────── 临时脚本目录 ─────────────
 # 一次性/调试用脚本放 scripts/_temp/，不入库
 scripts/_temp/
+
+# ───────────── 临时反编译/分析产物（根目录）─────────────
+.temp_classes/
+.temp_sources/
+_cleanup_dirs.ps1
