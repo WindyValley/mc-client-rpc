@@ -27,6 +27,19 @@ mc-client-rpc 在 **Minecraft 客户端进程内**开一个 JSON-RPC 服务，�
 
 ---
 
+## 工程文档（交接）
+
+面向维护与交接的工程学文档：
+
+- [交接总览](docs/handoff.md)
+- [架构](docs/architecture.md)
+- [线程模型](docs/thread-model.md)
+- [输入模拟方案](docs/input-injection.md)
+- [RPC API 参考](docs/rpc-api.md)
+- [测试策略](docs/testing.md)
+
+---
+
 ## 工作原理
 
 ```
