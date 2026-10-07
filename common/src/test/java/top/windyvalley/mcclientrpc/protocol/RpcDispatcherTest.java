@@ -51,10 +51,11 @@ class RpcDispatcherTest {
     }
 
     @Test
-    void 非法JSON返回32700() {
+    void 非法JSON返回32700且id为null() {
         RpcDispatcher d = new RpcDispatcher();
         JsonObject resp = parse(d.handle("这不是json"));
         assertEquals(-32700, resp.getAsJsonObject("error").get("code").getAsInt());
+        assertTrue(resp.get("id").isJsonNull(), "解析失败时无法取得 id，应返回 null");
     }
 
     @Test
@@ -89,11 +90,48 @@ class RpcDispatcherTest {
     }
 
     @Test
-    void id为null时按0处理() {
+    void id缺失或为null时返回JSON_null() {
         RpcDispatcher d = new RpcDispatcher();
         d.register("x", p -> "ok");
-        JsonObject resp = parse(d.handle("{\"jsonrpc\":\"2.0\",\"method\":\"x\",\"id\":null}"));
-        assertEquals(0, resp.get("id").getAsInt());
+        JsonObject noId = parse(d.handle("{\"jsonrpc\":\"2.0\",\"method\":\"x\"}"));
+        assertTrue(noId.get("id").isJsonNull());
+        JsonObject nullId = parse(d.handle("{\"jsonrpc\":\"2.0\",\"method\":\"x\",\"id\":null}"));
+        assertTrue(nullId.get("id").isJsonNull());
+    }
+
+    @Test
+    void 字符串id原样回传() {
+        RpcDispatcher d = new RpcDispatcher();
+        d.register("x", p -> "ok");
+        JsonObject resp = parse(d.handle(
+                "{\"jsonrpc\":\"2.0\",\"method\":\"x\",\"id\":\"req-abc-001\"}"));
+        assertEquals("req-abc-001", resp.get("id").getAsString());
         assertEquals("ok", resp.get("result").getAsString());
+    }
+
+    @Test
+    void rpcException透传错误码与data() {
+        RpcDispatcher d = new RpcDispatcher();
+        d.register("far", params -> {
+            throw new RpcException(RpcErrorCodes.OUT_OF_REACH, "超出触及距离",
+                    java.util.Map.of("distance", 6.2, "reach", 3.0));
+        });
+        JsonObject resp = parse(d.handle("{\"jsonrpc\":\"2.0\",\"method\":\"far\",\"id\":5}"));
+        JsonObject err = resp.getAsJsonObject("error");
+        assertEquals(-32003, err.get("code").getAsInt());
+        assertEquals(6.2, err.getAsJsonObject("data").get("distance").getAsDouble());
+        assertEquals(3.0, err.getAsJsonObject("data").get("reach").getAsDouble());
+    }
+
+    @Test
+    void rpcException无data时不携带data字段() {
+        RpcDispatcher d = new RpcDispatcher();
+        d.register("nf", params -> {
+            throw new RpcException(RpcErrorCodes.TARGET_NOT_FOUND, "无目标");
+        });
+        JsonObject resp = parse(d.handle("{\"jsonrpc\":\"2.0\",\"method\":\"nf\",\"id\":6}"));
+        JsonObject err = resp.getAsJsonObject("error");
+        assertEquals(-32002, err.get("code").getAsInt());
+        assertFalse(err.has("data"));
     }
 }

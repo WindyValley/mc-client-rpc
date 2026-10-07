@@ -1,6 +1,9 @@
 package top.windyvalley.mcclientrpc.protocol;
 
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
@@ -15,11 +18,18 @@ import java.util.function.Function;
  * 不知道任何 MC 类型；handler 由上层（client 包）注册，
  * 输入输出都是 {@link JsonObject} / {@link Object}。
  *
+ * <p>错误分层：
+ * <ul>
+ *   <li>{@link RpcException}：预期业务错误，保留其 code 与 data</li>
+ *   <li>其他 handler 异常：统一 -32603 internal error</li>
+ * </ul>
+ *
  * <p>线程安全：注册在启动时完成（单线程），之后只读。
  */
 public final class RpcDispatcher {
 
-    private static final Gson GSON = new Gson();
+    // serializeNulls：id 为 JSON null 时必须出现在响应里（默认 Gson 会跳过 null 成员）
+    private static final Gson GSON = new GsonBuilder().serializeNulls().create();
 
     /** method → handler(params) -> result。 */
     private final Map<String, Function<JsonObject, Object>> handlers = new LinkedHashMap<>();
@@ -39,55 +49,67 @@ public final class RpcDispatcher {
      * 处理一行 JSON-RPC 请求，返回响应 JSON 文本。
      *
      * <p>协议：{@code {"jsonrpc":"2.0","method":"m","params":{...},"id":N}}
-     * 成功返回 {@code result}，失败返回 {@code error:{code,message}}。
-     * 解析失败 code=-32700，未知方法 code=-32601，handler 异常 code=-32603。
+     * 成功返回 {@code result}，失败返回 {@code error:{code,message[,data]}}。
+     * id 允许 number 或 string，按原样回传；无法解析请求时 id 为 JSON null。
+     * 解析失败 code=-32700，未知方法 code=-32601；
+     * {@link RpcException} 透传其 code，其他 handler 异常 code=-32603。
      */
     public String handle(String jsonLine) {
         JsonObject resp = new JsonObject();
         resp.addProperty("jsonrpc", "2.0");
 
         // ── 第一阶段：解析请求 ──
-        // 解析失败（语法错 / 顶层不是对象 / method 不是字符串）统一 -32700。
-        // getAsJsonObject() 抛的 IllegalStateException("Not a JSON object") 属此类。
+        // 解析失败（语法错 / 顶层不是对象）统一 -32700，此时无法取得 id。
         JsonObject req;
-        int id = 0;
+        JsonElement id = null;
         try {
             req = JsonParser.parseString(jsonLine).getAsJsonObject();
             if (req.has("id") && !req.get("id").isJsonNull()) {
-                id = req.get("id").getAsInt();
+                id = req.get("id");
             }
         } catch (Exception e) {
-            return error(resp, 0, -32700, "JSON 解析失败: " + e.getMessage());
+            return error(resp, null, RpcErrorCodes.PARSE_ERROR, "JSON 解析失败: " + e.getMessage(), null);
         }
-        resp.addProperty("id", id);
+        writeId(resp, id);
 
         // ── 第二阶段：路由 + 执行业务 handler ──
-        // handler 抛的异常（含 IllegalStateException，如「玩家未进入世界」）属业务错误 -32603。
         try {
             if (!req.has("method")) {
-                return error(resp, id, -32600, "缺少 method 字段");
+                return error(resp, id, RpcErrorCodes.INVALID_REQUEST, "缺少 method 字段", null);
             }
             String method = req.get("method").getAsString();
             Function<JsonObject, Object> handler = handlers.get(method);
             if (handler == null) {
-                return error(resp, id, -32601, "未知方法: " + method);
+                return error(resp, id, RpcErrorCodes.METHOD_NOT_FOUND, "未知方法: " + method, null);
             }
             JsonObject params = req.has("params") && req.get("params").isJsonObject()
                     ? req.getAsJsonObject("params") : new JsonObject();
             Object result = handler.apply(params);
             resp.add("result", GSON.toJsonTree(result));
+        } catch (RpcException e) {
+            // 预期业务错误：保留稳定错误码与 data
+            return error(resp, id, e.code(), e.getMessage(), e.data());
         } catch (Exception e) {
-            return error(resp, id, -32603, e.getClass().getSimpleName() + ": " + e.getMessage());
+            return error(resp, id, RpcErrorCodes.INTERNAL_ERROR,
+                    e.getClass().getSimpleName() + ": " + e.getMessage(), null);
         }
         return GSON.toJson(resp);
     }
 
-    private String error(JsonObject resp, int id, int code, String message) {
-        resp.addProperty("id", id);
+    private String error(JsonObject resp, JsonElement id, int code, String message, Object data) {
+        writeId(resp, id);
         JsonObject err = new JsonObject();
         err.addProperty("code", code);
         err.addProperty("message", message);
+        if (data != null) {
+            err.add("data", GSON.toJsonTree(data));
+        }
         resp.add("error", err);
         return GSON.toJson(resp);
+    }
+
+    /** id 原样回传；为 null（缺失 / JsonNull / 无法解析）时写 JSON null。 */
+    private static void writeId(JsonObject resp, JsonElement id) {
+        resp.add("id", id == null ? JsonNull.INSTANCE : id);
     }
 }
