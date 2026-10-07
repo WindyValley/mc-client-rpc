@@ -15,6 +15,8 @@ import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.HitResult;
 import top.windyvalley.mcclientrpc.McClientRpc;
 import top.windyvalley.mcclientrpc.protocol.RpcDispatcher;
+import top.windyvalley.mcclientrpc.protocol.RpcErrorCodes;
+import top.windyvalley.mcclientrpc.protocol.RpcException;
 
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -57,10 +59,17 @@ public final class ClientPlayerController {
     /** 持续移动目标：非空时 tick() 每帧朝它前进并瞄准，跑赢 input.tick() 的键盘覆盖。 */
     private volatile Entity moveTarget;
 
-    /** 攻击目标：非空时 tick() 每帧检查距离,远了 moveToward,近了 attack 并 complete future。 */
-    private volatile Entity attackTarget;
-    /** 攻击完成回调:tick() 里 attack 后 complete。 */
-    private volatile CompletableFuture<Object> attackFuture;
+    /**
+     * 攻击会话：同一时刻最多一个，只在 render thread 读写。
+     * 取消与 tick 攻击段都在 render thread，天然互斥，无需额外令牌。
+     */
+    private record AttackSession(Entity target, CompletableFuture<Object> future) {
+    }
+
+    private volatile AttackSession attackSession;
+
+    /** 无返回任务队列：只需要在 render thread 执行副作用（如取消），不产生结果。 */
+    private final ConcurrentLinkedQueue<Runnable> clientRunnables = new ConcurrentLinkedQueue<>();
 
     /**
      * 提交一个任务到 render thread 执行，阻塞等待结果。
@@ -90,6 +99,16 @@ public final class ClientPlayerController {
      * <p>由平台层 ClientTickEvent 每帧调用。
      */
     public void tick() {
+        // 0. 消费无返回任务（取消等副作用）
+        Runnable r;
+        while ((r = clientRunnables.poll()) != null) {
+            try {
+                r.run();
+            } catch (Throwable t) {
+                McClientRpc.LOGGER.warn("[RPC] 客户端任务执行异常", t);
+            }
+        }
+
         // 1. 消费 RPC 任务队列（render thread 执行 MC 操控）
         ClientTask task;
         while ((task = queue.poll()) != null) {
@@ -130,15 +149,15 @@ public final class ClientPlayerController {
             }
         }
 
-        // 3. 攻击目标:tick() 每帧检查距离,远了 moveToward,近了 attack 并 complete future。
-        //    参考怪物 MeleeAttackGoal 的设计:持续 tick 驱动,触及内+视线通才攻击。
-        Entity atkTarget = attackTarget;
-        CompletableFuture<Object> atkFuture = attackFuture;
-        if (atkTarget != null && atkFuture != null && p != null) {
+        // 3. 攻击会话:tick() 每帧检查距离,远了继续推进,近了 attack 并 complete future。
+        //    参考怪物 MeleeAttackGoal 的设计:持续 tick 驱动,触及内才攻击。
+        AttackSession atk = attackSession;
+        if (atk != null && p != null) {
+            Entity atkTarget = atk.target();
+            CompletableFuture<Object> atkFuture = atk.future();
             if (!atkTarget.isAlive()) {
                 atkFuture.complete("错误: 目标已死亡");
-                attackTarget = null;
-                attackFuture = null;
+                attackSession = null;
             } else {
                 double dist = p.distanceTo(atkTarget);
                 double reach = p.entityInteractionRange();
@@ -153,11 +172,10 @@ public final class ClientPlayerController {
                     } else {
                         atkFuture.complete("错误: gameMode 未就绪");
                     }
-                    attackTarget = null;
-                    attackFuture = null;
+                    attackSession = null;
                     moveTarget = null; // 停止移动
                 } else {
-                    // 继续 moveToward(设 moveTarget,让上面的逻辑推进)
+                    // 继续朝目标推进(设 moveTarget,让上面的逻辑带动)
                     moveTarget = atkTarget;
                 }
             }
@@ -183,44 +201,52 @@ public final class ClientPlayerController {
         d.register("player.pos", p -> submitOnClientThread(this::playerPos, 3000));
         d.register("player.attack", p -> submitOnClientThread(() -> attackNearest(str(p, "target", "zombie")), 5000));
         // 高级指令:自动寻路到目标 → 进入触及范围 → 攻击(参考怪物 MeleeAttackGoal)
-        // 注意:不能用 submitOnClientThread 里阻塞 future.get()——那会卡死 render thread,
-        // tick() 的 attackTarget 处理永远没机会跑(死锁)。
-        // 正确做法:RPC 线程上阻塞,先提交一个瞬间完成的「设置目标」任务,
-        // render thread 继续 tick 处理寻路+攻击,完成后 complete attackFuture。
+        // 不能用 submitOnClientThread 里阻塞 future.get()——那会卡死 render thread,
+        // tick() 的攻击段永远没机会跑(死锁)。
+        // 正确做法:RPC 线程先提交一个瞬间完成的「开启会话」任务,
+        // render thread 继续 tick 处理寻路+攻击,完成后 complete future。
         d.register("player.attackNearest", p -> {
             String typeKey = str(p, "target", "zombie");
-            CompletableFuture<Object> attackFuture = new CompletableFuture<>();
+            CompletableFuture<Object> resultFuture = new CompletableFuture<>();
             CompletableFuture<Object> setupFuture = new CompletableFuture<>();
-            // 快速任务:在 render thread 设置 attackTarget(瞬间完成)
+            // 快速任务:在 render thread 开启攻击会话(瞬间完成)
             queue.add(new ClientTask(() -> {
-                attackNearestAsync(typeKey, attackFuture);
+                startAttackSession(typeKey, resultFuture);
                 return "已锁定目标";
             }, setupFuture));
-            // 等设置任务跑完(确认目标找到)
+            // 等设置任务跑完(会话是否成功开启;忙 / 找不到目标在此抛出)
             try {
                 setupFuture.get(5, TimeUnit.SECONDS);
-            } catch (Exception e) {
-                attackTarget = null;
-                attackFuture.complete("错误: 设置攻击目标失败: " + e.getMessage());
+            } catch (TimeoutException e) {
+                return "错误: 客户端线程执行超时(5s)——可能未进入世界或游戏卡顿";
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause() == null ? e : e.getCause();
+                if (cause instanceof RpcException re) {
+                    throw re;
+                }
+                throw new RpcException(RpcErrorCodes.INTERNAL_ERROR,
+                        "开启攻击会话失败: " + cause.getMessage());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return "错误: 等待被中断";
             }
             // RPC 线程上阻塞等结果(render thread 不阻塞,继续 tick)
             try {
-                return attackFuture.get(15000, TimeUnit.MILLISECONDS);
+                return resultFuture.get(15000, TimeUnit.MILLISECONDS);
             } catch (TimeoutException e) {
-                // 超时清理状态,避免卡死
-                queue.add(new ClientTask(() -> {
-                    attackTarget = null; moveTarget = null;
-                    return null;
-                }, new CompletableFuture<>()));
-                attackTarget = null;
+                // 超时只在 render thread 清理自己的会话(无返回通道,不造 future)
+                clientRunnables.add(() -> {
+                    if (attackSession != null && attackSession.future() == resultFuture) {
+                        attackSession = null;
+                        moveTarget = null;
+                    }
+                });
                 return "错误: 攻击超时(15s)——可能目标太远/找不到路径";
             } catch (ExecutionException e) {
-                attackTarget = null;
                 Throwable cause = e.getCause() == null ? e : e.getCause();
                 return "错误: " + cause.getClass().getSimpleName() + ": " + cause.getMessage();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                attackTarget = null;
                 return "错误: 等待被中断";
             }
         });
@@ -418,29 +444,27 @@ public final class ClientPlayerController {
     }
 
     /**
-     * 高级指令:自动寻路到目标 → 进入触及范围 → 攻击。
+     * 开启攻击会话（render thread 调用）。
      *
-     * <p>参考怪物 {@code MeleeAttackGoal} 的设计:持续 tick 驱动,
-     * 触及内+视线通才攻击。与 {@link #attackNearest} 的区别:
-     * <ul>
-     *   <li>{@code attackNearest}:一次性,距离远直接报错,需调用方先 moveToward</li>
-     *   <li>{@code attackNearestAsync}:自动寻路,tick 里循环检查距离,
-     *       到达触及范围后自动攻击,结果经 future 异步返回</li>
-     * </ul>
-     *
-     * <p>实现:设 {@link #attackTarget} + {@link #attackFuture},
-     * tick() 里每帧检查距离,远了 moveToward,近了 attack 并 complete future。
+     * <p>同一时刻只允许一个高层操作：已有会话进行中时抛 {@link RpcException}（BUSY），
+     * 不覆盖旧会话，先发起的调用不会因此挂死。目标不存在时抛 TARGET_NOT_FOUND，
+     * data 携带搜索半径。
      */
-    private void attackNearestAsync(String typeKey, CompletableFuture<Object> future) {
+    private void startAttackSession(String typeKey, CompletableFuture<Object> future) {
         LocalPlayer p = requirePlayer();
+        if (attackSession != null) {
+            throw new RpcException(RpcErrorCodes.BUSY,
+                    "已有进行中的攻击操作，请等待完成或稍后重试",
+                    java.util.Map.of("currentTarget",
+                            attackSession.target().getType().toString()));
+        }
         Entity target = nearestEntity(p, typeKey, 32.0);
         if (target == null) {
-            future.complete("错误: 附近 32 格内无 " + typeKey);
-            return;
+            throw new RpcException(RpcErrorCodes.TARGET_NOT_FOUND,
+                    "附近 " + 32 + " 格内无 " + typeKey,
+                    java.util.Map.of("target", typeKey, "radius", 32));
         }
-        // 设攻击目标,tick() 里循环处理(远了 moveToward,近了 attack)
-        attackTarget = target;
-        attackFuture = future;
+        attackSession = new AttackSession(target, future);
     }
 
     /**
@@ -580,7 +604,7 @@ public final class ClientPlayerController {
     private LocalPlayer requirePlayer() {
         LocalPlayer p = mc.player;
         if (p == null) {
-            throw new IllegalStateException("玩家未进入世界");
+            throw new RpcException(RpcErrorCodes.NOT_READY, "玩家未进入世界");
         }
         return p;
     }
