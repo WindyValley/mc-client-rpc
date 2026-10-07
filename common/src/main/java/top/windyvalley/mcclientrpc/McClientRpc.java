@@ -40,7 +40,7 @@ public final class McClientRpc {
     public static void initClient() {
         LOGGER.info("mc-client-rpc 客户端初始化");
 
-        // 启动 JSON-RPC 服务（默认端口 25586，区别于服务端验证设施的 25585）
+        // 启动 JSON-RPC 服务（默认端口 25586）
         rpcService = new ClientRpcService();
         rpcService.start();
 

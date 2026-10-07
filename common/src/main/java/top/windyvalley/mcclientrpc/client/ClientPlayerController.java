@@ -43,7 +43,7 @@ import java.util.function.Supplier;
  */
 public final class ClientPlayerController {
 
-    /** RPC 默认监听端口（区别于服务端验证设施的 25585）。 */
+    /** RPC 默认监听端口。 */
     public static final int DEFAULT_PORT = 25586;
 
     /** 操控任务：在 render thread 执行，产出结果。 */
