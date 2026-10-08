@@ -152,32 +152,24 @@ public final class ClientPlayerController {
         }
 
         // 2. 持续移动：有激活目标时每帧朝它推进。
-        //    直接改 input 字段无效——KeyboardInput.tick() 每帧开头从键盘覆盖
-        //    forwardImpulse/leftImpulse（试过 CLIENT_POST 重设仍被下一帧清掉）。
-        //    改用 setDeltaMovement 朝目标推进：产生真实的玩家位移包
-        //    (ServerboundMovePlayerPacket)，服务端照常更新位置+校验触及距离，
-        //    移动本身是真实网络位移，不是服务端伪造坐标。
+        //    真机实测：CLIENT_POST 里 setDeltaMovement 玩家完全不动(tick 已结束、
+        //    不在正常移动链路上，下一帧被输入/摩擦清掉)。故与 player.move 一致，
+        //    驱动按键映射，由下一帧原版 tick 自然移动并发包；aimAt 负责转向。
         Entity target = moveTarget;
         LocalPlayer p = mc.player;
         if (target != null && p != null) {
-            // 注意:moveTarget 的「到达」条件要比 attackTarget 的「触及」更严格(reach - 0.5),
-            // 否则 moveTarget 提前停,attackTarget 永远到不了触及范围。
             if (!target.isAlive() || p.distanceTo(target) <= p.entityInteractionRange() - 0.5) {
-                // 到达或目标消失:停止
-                moveTarget = null;
-                p.setDeltaMovement(p.getDeltaMovement().x * 0.5, p.getDeltaMovement().y,
-                        p.getDeltaMovement().z * 0.5);
+                // 到达或目标消失：停止（清目标 + 释放键，复用 stopMove）
+                stopMove();
             } else {
-                // 朝目标方向推进（保留 y 速度让重力/跳跃正常）
+                // aimAt 已把视角对准目标，按键映射相对玩家朝向：
+                // 只按 W(keyUp)即沿视线直线走向目标，等价 player.move forward=1（已实测）。
                 aimAt(p, target);
-                double dx = target.getX() - p.getX();
-                double dz = target.getZ() - p.getZ();
-                double len = Math.sqrt(dx * dx + dz * dz);
-                if (len > 1.0e-4) {
-                    double speed = 0.22; // 约等于玩家疾走水平速度（格/tick）
-                    p.setDeltaMovement(dx / len * speed, p.getDeltaMovement().y, dz / len * speed);
-                    p.hurtMarked = true; // 触发位移同步
-                }
+                var o = mc.options;
+                o.keyUp.setDown(true);
+                o.keyDown.setDown(false);
+                o.keyLeft.setDown(false);
+                o.keyRight.setDown(false);
             }
         }
 
