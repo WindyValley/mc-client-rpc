@@ -318,7 +318,8 @@ public final class ClientPlayerController {
         try {
             setupFuture.get(5, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
-            return "错误: 客户端线程执行超时(5s)——可能未进入世界或游戏卡顿";
+            throw new RpcException(RpcErrorCodes.TIMEOUT,
+                    "客户端线程 5s 内未执行会话开启（可能未进世界或游戏卡顿）");
         } catch (ExecutionException e) {
             Throwable cause = e.getCause() == null ? e : e.getCause();
             if (cause instanceof RpcException re) {
@@ -328,7 +329,7 @@ public final class ClientPlayerController {
                     "开启攻击会话失败: " + cause.getMessage());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return "错误: 等待被中断";
+            throw new RpcException(RpcErrorCodes.INTERNAL_ERROR, "等待会话开启被中断");
         }
         try {
             return resultFuture.get(15000, TimeUnit.MILLISECONDS);
@@ -340,13 +341,19 @@ public final class ClientPlayerController {
                     moveTarget = null;
                 }
             });
-            return "错误: 攻击超时(15s)——可能目标太远/找不到路径";
+            throw new RpcException(RpcErrorCodes.TIMEOUT,
+                    "攻击 15s 内未完成（目标太远或找不到路径）",
+                    java.util.Map.of("target", typeKey, "timeoutMs", 15000));
         } catch (ExecutionException e) {
             Throwable cause = e.getCause() == null ? e : e.getCause();
-            return "错误: " + cause.getClass().getSimpleName() + ": " + cause.getMessage();
+            if (cause instanceof RpcException re) {
+                throw re;
+            }
+            throw new RpcException(RpcErrorCodes.INTERNAL_ERROR,
+                    cause.getClass().getSimpleName() + ": " + cause.getMessage());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return "错误: 等待被中断";
+            throw new RpcException(RpcErrorCodes.INTERNAL_ERROR, "等待攻击结果被中断");
         }
     }
 

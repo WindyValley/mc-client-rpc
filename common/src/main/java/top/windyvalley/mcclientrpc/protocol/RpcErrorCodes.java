@@ -21,6 +21,8 @@ public final class RpcErrorCodes {
     public static final int INTERNAL_ERROR = -32603;
 
     // ── 业务错误码（-32000 ~ -32099）──
+    /** 操作在限定时间内未完成。 */
+    public static final int TIMEOUT = -32000;
     /** 客户端 / 玩家状态不满足调用前提（如未进入世界）。 */
     public static final int NOT_READY = -32001;
     /** 未找到匹配目标。 */

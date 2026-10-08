@@ -65,13 +65,13 @@ mc-client-rpc 在 **Minecraft 客户端进程内**开一个 JSON-RPC 服务，�
 
 ## 支持的 RPC 方法
 
-> 约定：参数为可选时给出默认值。成功返回字符串 `result`；失败返回 `error`。
+> 约定：参数为可选时给出默认值；标「必传」的参数缺失会报错。成功返回结构化 `result`（对象/数值/字符串）；失败返回 `error`。完整参数 schema 用 `methods.list` 自描述获取。
 
 ### 通用
 
 | 方法 | 参数 | 说明 |
 |------|------|------|
-| `methods.list` | — | 列出所有已注册方法名 |
+| `methods.list` | — | 列出所有已注册方法及其参数 schema（名称/类型/必传/默认值/说明）|
 
 ### 客户端导航（进世界前后均可用）
 
@@ -79,7 +79,7 @@ mc-client-rpc 在 **Minecraft 客户端进程内**开一个 JSON-RPC 服务，�
 |------|------|------|
 | `client.status` | — | 当前界面 / 是否已进世界 / 是否已连服务器 / 服务器地址——自动化的「眼睛」 |
 | `client.toTitle` | — | 切到主菜单，跳过无障碍引导屏（`AccessibilityOnboardingScreen`）等拦路界面 |
-| `client.connect` | `host`（默认 127.0.0.1）, `port`（默认 25565）| 直连服务器，异步发起；配合 `client.status` 轮询到「已进世界」 |
+| `client.connect` | `host`（**必传**）, `port`（默认 25565）| 直连服务器，异步发起；配合 `client.status` 轮询到「已进世界」。不提供默认地址 |
 | `client.disconnect` | — | 断开连接、回主菜单（测试间重置）|
 | `client.quit` | — | 完全退出客户端进程（等价标题屏「退出」）|
 
@@ -138,13 +138,13 @@ mc-client-rpc 在 **Minecraft 客户端进程内**开一个 JSON-RPC 服务，�
 成功：
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":"已攻击 entity.minecraft.zombie (距离 2.0 格) —— 真实输入路径"}
+{"jsonrpc":"2.0","id":1,"result":{"type":"minecraft:zombie","distance":2.0}}
 ```
 
 错误：
 
 ```json
-{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"entity.minecraft.zombie 距离 4.1 格，超出触及范围 3.0 格"}}
+{"jsonrpc":"2.0","id":1,"error":{"code":-32003,"message":"minecraft:zombie 距离 4.1 格，超出触及范围 3.0 格","data":{"distance":4.1,"maxReach":3.0}}}
 ```
 
 错误码：
@@ -152,9 +152,17 @@ mc-client-rpc 在 **Minecraft 客户端进程内**开一个 JSON-RPC 服务，�
 | code | 含义 |
 |------|------|
 | -32700 | 请求解析失败（非合法 JSON）|
-| -32600 | 无效请求（缺 `method`）|
+| -32600 | 无效请求（缺 `method`、jsonrpc 版本不符、params 非对象）|
 | -32601 | 未知方法 |
-| -32603 | 业务异常（如超距、玩家未进世界）|
+| -32602 | 无效参数（必传参数缺失）|
+| -32000 | 超时（操作未在限定时间内完成）|
+| -32001 | 玩家未进世界 |
+| -32002 | 目标不存在 |
+| -32003 | 超出触及范围 |
+| -32004 | 操作忙（已有同类高级指令在执行）|
+| -32603 | 其他内部异常 |
+
+> -32000 及以上（数值上更小）为本框架业务错误码区间，`error.data` 可能携带结构化细节。
 
 最小调用：
 
@@ -175,7 +183,7 @@ Python 调用示例见 [`scripts/combat_loop_test.py`](scripts/combat_loop_test.
 ./gradlew :fabric:runClient    # 启动 Fabric 客户端
 ```
 
-NeoForge 的 `runClient` 已预置离线参数（见 `neoforge/build.gradle`）：`--quickPlayMultiplayer 127.0.0.1:25565 --username Dev`，启动即直连测试服。
+`runClient` 启动后停在标题屏（离线用户名 `Dev`，分辨率 854×480），由外部脚本通过 `client.connect` 主动连接服务器。
 
 **作为附加 mod 使用**：本框架是一个独立 mod。把构建出的 `mc-client-rpc-0.1.0.jar` 放进被测客户端的 `mods/` 目录，从客户端入口启动后即监听 25586。
 
@@ -208,7 +216,9 @@ NeoForge 的 `runClient` 已预置离线参数（见 `neoforge/build.gradle`）�
 
 ## ⚠️ 安全
 
-本服务监听 TCP 端口、**无鉴权**，是测试设施，**仅限受信任的本地网络**。任何人连上端口即可操控游戏角色。**不要部署到公网或不可信环境。**
+- 服务**默认只绑定回环地址 `127.0.0.1`**，只有本机程序能连；无鉴权。
+- 单行请求上限 1MB、读超时 30s、最多 16 个并发连接，超限的连接会被拒绝或断开。
+- 它仍是**测试设施**：任何能连上端口的本机程序都能操控游戏角色。不要把端口暴露到公网或不可信网络；确需远程连时，应通过显式配置改绑地址并自行加网络层防护。
 
 ---
 
