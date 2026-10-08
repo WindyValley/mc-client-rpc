@@ -57,15 +57,12 @@ public final class RpcDispatcher {
     }
 
     /**
-     * 处理一行 JSON-RPC 请求，返回响应 JSON 文本。
+     * 处理一行 JSON-RPC 请求。
      *
-     * <p>协议：{@code {"jsonrpc":"2.0","method":"m","params":{...},"id":N}}
-     * 成功返回 {@code result}，失败返回 {@code error:{code,message[,data]}}。
-     * id 允许 number 或 string，按原样回传；无法解析请求时 id 为 JSON null。
-     * 解析失败 code=-32700，未知方法 code=-32601；
-     * {@link RpcException} 透传其 code，其他 handler 异常 code=-32603。
+     * @return Response：{@code notification=true} 时调用方不得回写内容；
+     *         否则 {@code json} 为要回写的响应文本
      */
-    public String handle(String jsonLine) {
+    public Response dispatch(String jsonLine) {
         JsonObject resp = new JsonObject();
         resp.addProperty("jsonrpc", "2.0");
 
@@ -79,32 +76,67 @@ public final class RpcDispatcher {
                 id = req.get("id");
             }
         } catch (Exception e) {
-            return error(resp, null, RpcErrorCodes.PARSE_ERROR, "JSON 解析失败: " + e.getMessage(), null);
+            return new Response(false,
+                    error(resp, null, RpcErrorCodes.PARSE_ERROR, "JSON 解析失败: " + e.getMessage(), null));
         }
+        // 无 id（缺失 / JsonNull）= notification：按协议不回响应
+        boolean notification = id == null;
         writeId(resp, id);
 
         // ── 第二阶段：路由 + 执行业务 handler ──
+        String responseJson;
         try {
+            if (req.has("jsonrpc") && !"2.0".equals(req.get("jsonrpc").getAsString())) {
+                throw new RpcException(RpcErrorCodes.INVALID_REQUEST,
+                        "不支持的 jsonrpc 版本: " + req.get("jsonrpc").getAsString());
+            }
             if (!req.has("method")) {
-                return error(resp, id, RpcErrorCodes.INVALID_REQUEST, "缺少 method 字段", null);
+                return new Response(notification,
+                        error(resp, id, RpcErrorCodes.INVALID_REQUEST, "缺少 method 字段", null));
             }
             String method = req.get("method").getAsString();
             MethodDefinition definition = handlers.get(method);
             if (definition == null) {
-                return error(resp, id, RpcErrorCodes.METHOD_NOT_FOUND, "未知方法: " + method, null);
+                return new Response(notification,
+                        error(resp, id, RpcErrorCodes.METHOD_NOT_FOUND, "未知方法: " + method, null));
             }
-            JsonObject params = req.has("params") && req.get("params").isJsonObject()
-                    ? req.getAsJsonObject("params") : new JsonObject();
+            JsonObject params;
+            if (!req.has("params") || req.get("params").isJsonNull()) {
+                params = new JsonObject();
+            } else if (req.get("params").isJsonObject()) {
+                params = req.getAsJsonObject("params");
+            } else {
+                // by-position（params 数组）当前不支持：明确报错，不静默按空对象走默认值
+                throw new RpcException(RpcErrorCodes.INVALID_REQUEST,
+                        "params 必须是 JSON 对象（按名称传参）");
+            }
             Object result = definition.handler().apply(params);
             resp.add("result", GSON.toJsonTree(result));
+            responseJson = GSON.toJson(resp);
         } catch (RpcException e) {
             // 预期业务错误：保留稳定错误码与 data
-            return error(resp, id, e.code(), e.getMessage(), e.data());
+            responseJson = error(resp, id, e.code(), e.getMessage(), e.data());
         } catch (Exception e) {
-            return error(resp, id, RpcErrorCodes.INTERNAL_ERROR,
+            responseJson = error(resp, id, RpcErrorCodes.INTERNAL_ERROR,
                     e.getClass().getSimpleName() + ": " + e.getMessage(), null);
         }
-        return GSON.toJson(resp);
+        // notification：即使处理中出错也不回响应（JSON-RPC 规定）
+        return notification ? Response.NOTIFICATION : new Response(false, responseJson);
+    }
+
+    /** {@link #handle(String)} 的结果载体。 */
+    public record Response(boolean notification, String json) {
+        public static final Response NOTIFICATION = new Response(true, null);
+    }
+
+    /**
+     * 兼容入口：处理一行请求并返回响应文本。
+     *
+     * <p>注意：notification（无 id）返回 {@code null}，调用方不应回写；
+     * 需要 notification 标记时使用 {@link #dispatch(String)}。
+     */
+    public String handle(String jsonLine) {
+        return dispatch(jsonLine).json();
     }
 
     private String error(JsonObject resp, JsonElement id, int code, String message, Object data) {

@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 
@@ -92,13 +93,37 @@ class RpcDispatcherTest {
     }
 
     @Test
-    void id缺失或为null时返回JSON_null() {
+    void 无id请求按notification处理不回响应() {
         RpcDispatcher d = new RpcDispatcher();
         d.register("x", p -> "ok");
-        JsonObject noId = parse(d.handle("{\"jsonrpc\":\"2.0\",\"method\":\"x\"}"));
-        assertTrue(noId.get("id").isJsonNull());
-        JsonObject nullId = parse(d.handle("{\"jsonrpc\":\"2.0\",\"method\":\"x\",\"id\":null}"));
-        assertTrue(nullId.get("id").isJsonNull());
+        // 缺失 id：notification
+        RpcDispatcher.Response noId = d.dispatch(
+                "{\"jsonrpc\":\"2.0\",\"method\":\"x\"}");
+        assertTrue(noId.notification(), "无 id 请求应判定为 notification");
+        assertNull(noId.json(), "notification 不返回响应文本");
+        // id 显式为 null：同样是 notification
+        RpcDispatcher.Response nullId = d.dispatch(
+                "{\"jsonrpc\":\"2.0\",\"method\":\"x\",\"id\":null}");
+        assertTrue(nullId.notification());
+    }
+
+    @Test
+    void jsonrpc版本不为2时返回32600() {
+        RpcDispatcher d = new RpcDispatcher();
+        d.register("x", p -> "ok");
+        JsonObject resp = parse(d.handle(
+                "{\"jsonrpc\":\"1.0\",\"method\":\"x\",\"id\":1}"));
+        assertEquals(-32600, resp.getAsJsonObject("error").get("code").getAsInt());
+    }
+
+    @Test
+    void params为数组时明确返回32600() {
+        RpcDispatcher d = new RpcDispatcher();
+        d.register("x", p -> "ok");
+        JsonObject resp = parse(d.handle(
+                "{\"jsonrpc\":\"2.0\",\"method\":\"x\",\"params\":[1,2],\"id\":1}"));
+        assertEquals(-32600, resp.getAsJsonObject("error").get("code").getAsInt(),
+                "by-position params 当前不支持，应明确报错而非静默按空对象处理");
     }
 
     @Test
