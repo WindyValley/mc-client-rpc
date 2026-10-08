@@ -49,8 +49,12 @@ public final class ClientPlayerController {
     /** RPC 默认监听端口。 */
     public static final int DEFAULT_PORT = 25586;
 
-    /** 操控任务：在 render thread 执行，产出结果。 */
-    private record ClientTask(Supplier<Object> action, CompletableFuture<Object> future) {
+    /**
+     * 操控任务：在 render thread 执行。动作接收自己的 future，
+     * 自行决定立即完成（普通一帧式）还是登记后延迟完成（攻击命中判定）。
+     */
+    private record ClientTask(java.util.function.Consumer<CompletableFuture<Object>> action,
+                              CompletableFuture<Object> future) {
     }
 
     private final ConcurrentLinkedQueue<ClientTask> queue = new ConcurrentLinkedQueue<>();
@@ -71,6 +75,23 @@ public final class ClientPlayerController {
 
     private volatile AttackSession attackSession;
 
+    /**
+     * 延迟命中判定：攻击已经真实发起，等若干 tick 让服务端同步目标血量，
+     * 再读血量判定命中、完成 future。目标实体的血量是服务端权威，
+     * 攻击同帧在客户端读不到变化（实测服务端已 17→16，客户端仍读到 17）。
+     */
+    private record PendingHit(Entity target, float hpBefore,
+                              CompletableFuture<Object> future, int ticksLeft) {
+        PendingHit tickDown() {
+            return new PendingHit(target, hpBefore, future, ticksLeft - 1);
+        }
+    }
+
+    /** 攻击后等待服务端同步再判定的 tick 数（5 tick ≈ 250ms）。 */
+    private static final int HIT_CHECK_DELAY_TICKS = 5;
+
+    private final java.util.List<PendingHit> pendingHits = new java.util.ArrayList<>();
+
     /** 无返回任务队列：只需要在 render thread 执行副作用（如取消），不产生结果。 */
     private final ConcurrentLinkedQueue<Runnable> clientRunnables = new ConcurrentLinkedQueue<>();
 
@@ -80,7 +101,8 @@ public final class ClientPlayerController {
      * @param action  在 render thread 跑的操作（可访问 MC 状态）
      * @param timeoutMs 超时毫秒；超时返回错误而不是无限等
      */
-    private Object submitOnClientThread(Supplier<Object> action, long timeoutMs) {
+    private Object submitOnClientThread(java.util.function.Consumer<CompletableFuture<Object>> action,
+                                        long timeoutMs) {
         CompletableFuture<Object> future = new CompletableFuture<>();
         queue.add(new ClientTask(action, future));
         try {
@@ -123,7 +145,7 @@ public final class ClientPlayerController {
         ClientTask task;
         while ((task = queue.poll()) != null) {
             try {
-                task.future().complete(task.action().get());
+                task.action().accept(task.future());
             } catch (Throwable t) {
                 task.future().completeExceptionally(t);
             }
@@ -159,36 +181,56 @@ public final class ClientPlayerController {
             }
         }
 
-        // 3. 攻击会话:tick() 每帧检查距离,远了继续推进,近了 attack 并 complete future。
-        //    参考怪物 MeleeAttackGoal 的设计:持续 tick 驱动,触及内才攻击。
+        // 3. 攻击会话:tick() 每帧检查距离,远了继续推进,近了发起攻击。
+        //    参考怪物 MeleeAttackGoal:持续 tick 驱动,触及内才攻击。
+        //    攻击本身复用 performAttackOn,结果走延迟命中判定(pendingHits)。
         AttackSession atk = attackSession;
         if (atk != null && p != null) {
             Entity atkTarget = atk.target();
             CompletableFuture<Object> atkFuture = atk.future();
             if (!atkTarget.isAlive()) {
-                atkFuture.complete("错误: 目标已死亡");
+                atkFuture.completeExceptionally(new RpcException(
+                        RpcErrorCodes.TARGET_NOT_FOUND, "目标已死亡"));
                 attackSession = null;
+                moveTarget = null;
+            } else if (p.distanceTo(atkTarget) <= p.entityInteractionRange() - 0.2) {
+                // 到达触及范围:发起攻击(内部登记延迟命中判定,future 由 pendingHits 完成)
+                attackSession = null;
+                moveTarget = null;
+                performAttackOn(p, atkTarget, atkFuture);
             } else {
-                double dist = p.distanceTo(atkTarget);
-                double reach = p.entityInteractionRange();
-                if (dist <= reach - 0.2) {
-                    // 到达触及范围:瞄准 + 攻击 + 挥臂
-                    aimAt(p, atkTarget);
-                    if (mc.gameMode != null) {
-                        mc.gameMode.attack(p, atkTarget);
-                        p.swing(InteractionHand.MAIN_HAND);
-                        atkFuture.complete(String.format("已攻击 %s (距离 %.1f 格) —— 真实输入路径",
-                                atkTarget.getType().toString(), dist));
-                    } else {
-                        atkFuture.complete("错误: gameMode 未就绪");
-                    }
-                    attackSession = null;
-                    moveTarget = null; // 停止移动
+                // 继续朝目标推进(设 moveTarget,让上面的逻辑带动)
+                moveTarget = atkTarget;
+            }
+        }
+
+        // 4. 延迟命中判定:倒计 tick,到期读服务端已同步的血量组装结果。
+        if (!pendingHits.isEmpty()) {
+            java.util.Iterator<PendingHit> it = pendingHits.iterator();
+            java.util.List<PendingHit> next = new java.util.ArrayList<>();
+            while (it.hasNext()) {
+                PendingHit ph = it.next();
+                CompletableFuture<Object> f = ph.future();
+                if (f.isDone()) {
+                    continue; // 已被超时/取消处理
+                }
+                if (!ph.target().isAlive() && ph.hpBefore() > 0f) {
+                    // 目标被打死:也算命中成功,hpAfter=0
+                    f.complete(buildAttackResult(ph.target(),
+                            p.distanceTo(ph.target()), ph.hpBefore(), 0f));
+                    continue;
+                }
+                if (ph.ticksLeft() <= 1) {
+                    float hpAfter = ph.target() instanceof net.minecraft.world.entity.LivingEntity le
+                            ? le.getHealth() : ph.hpBefore();
+                    f.complete(buildAttackResult(ph.target(),
+                            p.distanceTo(ph.target()), ph.hpBefore(), hpAfter));
                 } else {
-                    // 继续朝目标推进(设 moveTarget,让上面的逻辑带动)
-                    moveTarget = atkTarget;
+                    next.add(ph.tickDown());
                 }
             }
+            pendingHits.clear();
+            pendingHits.addAll(next);
         }
     }
 
@@ -217,9 +259,9 @@ public final class ClientPlayerController {
         // ── 进入世界后（玩家操控）──
         registerClient(d, "player.pos", "查询玩家坐标、维度与血量",
                 List.of(), 3000, p -> playerPos());
-        registerClient(d, "player.attack", "在触及范围内攻击最近的指定类型实体",
+        registerClientDeferred(d, "player.attack", "在触及范围内攻击最近的指定类型实体",
                 List.of(RpcParamSpec.optional("target", "string", "zombie", "目标实体类型（精确匹配）")),
-                5000, p -> attackNearest(str(p, "target", "zombie")));
+                6000, p -> future -> performAttackDeferred(str(p, "target", "zombie"), future));
         // 高级指令跨多帧（寻路+攻击），不能走一帧式提交，见 runAttackNearest 注释。
         d.register(MethodDefinition.of("player.attackNearest",
                 "自动寻路到目标并攻击（tick 驱动，15s 超时）",
@@ -265,8 +307,26 @@ public final class ClientPlayerController {
     private void registerClient(RpcDispatcher d, String method, String description,
                                 List<RpcParamSpec> params, long timeoutMs,
                                 Function<JsonObject, Object> body) {
+        // 普通一帧式：body 立即产出结果，complete 自己的 future
+        d.register(MethodDefinition.of(method, description, params, p -> submitOnClientThread(future -> {
+            try {
+                future.complete(body.apply(p));
+            } catch (Throwable t) {
+                future.completeExceptionally(t);
+            }
+        }, timeoutMs)));
+    }
+
+    /**
+     * 注册需要控制完成时机的方法（如攻击后的延迟命中判定）：
+     * body 返回一个接收 future 的 render-thread 动作，可立即或延迟完成。
+     */
+    private void registerClientDeferred(RpcDispatcher d, String method, String description,
+                                        List<RpcParamSpec> params, long timeoutMs,
+                                        Function<JsonObject,
+                                                java.util.function.Consumer<CompletableFuture<Object>>> body) {
         d.register(MethodDefinition.of(method, description, params,
-                p -> submitOnClientThread(() -> body.apply(p), timeoutMs)));
+                p -> submitOnClientThread(body.apply(p), timeoutMs)));
     }
 
     /**
@@ -311,9 +371,13 @@ public final class ClientPlayerController {
     private Object runAttackNearest(String typeKey) {
         CompletableFuture<Object> resultFuture = new CompletableFuture<>();
         CompletableFuture<Object> setupFuture = new CompletableFuture<>();
-        queue.add(new ClientTask(() -> {
-            startAttackSession(typeKey, resultFuture);
-            return "已锁定目标";
+        queue.add(new ClientTask(setupF -> {
+            try {
+                startAttackSession(typeKey, resultFuture);
+                setupF.complete("已锁定目标");
+            } catch (Throwable t) {
+                setupF.completeExceptionally(t);
+            }
         }, setupFuture));
         try {
             setupFuture.get(5, TimeUnit.SECONDS);
@@ -586,43 +650,63 @@ public final class ClientPlayerController {
      * <p>返回结构化对象：目标类型、距离、触及距离、攻击前后血量与命中判定。
      * 超出触及距离时抛 OUT_OF_REACH，data 携带 distance / reach。
      */
-    private java.util.Map<String, Object> attackNearest(String typeKey) {
+    /**
+     * 攻击核心：守卫通过后真实发起攻击，并把命中判定登记到 {@link #pendingHits}，
+     * 等 {@link #HIT_CHECK_DELAY_TICKS} 个 tick 服务端同步血量后再完成 future。
+     *
+     * <p>在 render thread 执行（作为 deferred 任务的动作）。
+     */
+    private void performAttackDeferred(String typeKey, CompletableFuture<Object> future) {
         LocalPlayer p = requirePlayer();
         Entity target = targetResolver.nearestByType(p, typeKey, 32.0);
         if (target == null) {
-            throw new RpcException(RpcErrorCodes.TARGET_NOT_FOUND,
+            future.completeExceptionally(new RpcException(RpcErrorCodes.TARGET_NOT_FOUND,
                     "附近 " + 32 + " 格内无 " + typeKey,
-                    java.util.Map.of("target", typeKey, "radius", 32));
+                    java.util.Map.of("target", typeKey, "radius", 32)));
+            return;
         }
+        performAttackOn(p, target, future);
+    }
+
+    /**
+     * 对已确定的目标发起真实攻击并登记延迟命中判定。
+     * player.attack（当场解析目标）与攻击会话（早已锁定目标）共用此路径。
+     */
+    private void performAttackOn(LocalPlayer p, Entity target, CompletableFuture<Object> future) {
         if (mc.gameMode == null) {
-            throw new RpcException(RpcErrorCodes.NOT_READY, "gameMode 未就绪（不在多人游戏？）");
+            future.completeExceptionally(new RpcException(
+                    RpcErrorCodes.NOT_READY, "gameMode 未就绪（不在多人游戏？）"));
+            return;
         }
         double dist = p.distanceTo(target);
-        // 触及距离守卫：生存模式玩家触及约 3 格（实体判定 + 服务端校验）。
         double reach = p.entityInteractionRange();
         if (dist > reach) {
-            throw new RpcException(RpcErrorCodes.OUT_OF_REACH,
+            future.completeExceptionally(new RpcException(RpcErrorCodes.OUT_OF_REACH,
                     "目标超出触及距离，需先走近",
-                    java.util.Map.of("distance", round1(dist), "reach", round1(reach)));
+                    java.util.Map.of("distance", round1(dist), "reach", round1(reach))));
+            return;
         }
         // 攻击前血量（LivingEntity 才有，用于命中判定）
-        Float hpBefore = target instanceof net.minecraft.world.entity.LivingEntity le
-                ? le.getHealth() : null;
-        // 视角对准目标（真实玩家会先瞄准）
+        boolean living = target instanceof net.minecraft.world.entity.LivingEntity;
+        float hpBefore = living ? ((net.minecraft.world.entity.LivingEntity) target).getHealth() : 0f;
+        // 真实攻击：视角对准 → 客户端攻击管线发包 → 挥臂（真人左键路径）
         aimAt(p, target);
-        // 真实攻击：走客户端攻击管线 → 发攻击包 → 服务端判定
         mc.gameMode.attack(p, target);
         p.swing(InteractionHand.MAIN_HAND);
-        // 命中判定：客户端预测血量（服务端权威，客户端血量稍后同步）
-        Float hpAfter = target instanceof net.minecraft.world.entity.LivingEntity le2
-                ? le2.getHealth() : null;
+        // 不同帧读血判定：登记延迟命中，结果由 tick() 在同步后组装完成
+        pendingHits.add(new PendingHit(target, hpBefore, future, HIT_CHECK_DELAY_TICKS));
+    }
+
+    /** 组装一次攻击的结构化结果（在延迟判定到期、服务端血量已同步后调用）。 */
+    private java.util.Map<String, Object> buildAttackResult(Entity target, double dist,
+                                                            float hpBefore, float hpAfter) {
         java.util.Map<String, Object> m = new LinkedHashMap<>();
         m.put("target", entityTypeId(target));
         m.put("distance", round1(dist));
-        m.put("reach", round1(reach));
+        m.put("reach", round1(mc.player.entityInteractionRange()));
         m.put("hpBefore", hpBefore);
         m.put("hpAfter", hpAfter);
-        m.put("hit", hpBefore != null && hpAfter != null && hpAfter < hpBefore);
+        m.put("hit", hpAfter < hpBefore);
         return m;
     }
 
