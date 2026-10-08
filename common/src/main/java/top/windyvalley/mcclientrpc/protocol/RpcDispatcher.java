@@ -8,6 +8,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 
@@ -31,18 +32,28 @@ public final class RpcDispatcher {
     // serializeNulls：id 为 JSON null 时必须出现在响应里（默认 Gson 会跳过 null 成员）
     private static final Gson GSON = new GsonBuilder().serializeNulls().create();
 
-    /** method → handler(params) -> result。 */
-    private final Map<String, Function<JsonObject, Object>> handlers = new LinkedHashMap<>();
+    /** method → 方法定义（handler + 元数据）。 */
+    private final Map<String, MethodDefinition> handlers = new LinkedHashMap<>();
 
-    /** 注册一个方法处理器。 */
-    public RpcDispatcher register(String method, Function<JsonObject, Object> handler) {
-        handlers.put(method, handler);
+    /** 注册完整方法定义（含参数 schema，是协议的单一事实来源）。 */
+    public RpcDispatcher register(MethodDefinition definition) {
+        handlers.put(definition.name(), definition);
         return this;
     }
 
-    /** 已注册的方法名（用于 methods.list 自描述）。 */
+    /** 便捷注册：仅有 handler、无元数据（自描述只显示方法名）。 */
+    public RpcDispatcher register(String method, Function<JsonObject, Object> handler) {
+        return register(new MethodDefinition(method, "", List.of(), handler));
+    }
+
+    /** 已注册的方法名（用于自描述）。 */
     public java.util.Set<String> methods() {
         return handlers.keySet();
+    }
+
+    /** 已注册的方法定义（methods.list 据此生成 schema）。 */
+    public java.util.Collection<MethodDefinition> definitions() {
+        return handlers.values();
     }
 
     /**
@@ -78,13 +89,13 @@ public final class RpcDispatcher {
                 return error(resp, id, RpcErrorCodes.INVALID_REQUEST, "缺少 method 字段", null);
             }
             String method = req.get("method").getAsString();
-            Function<JsonObject, Object> handler = handlers.get(method);
-            if (handler == null) {
+            MethodDefinition definition = handlers.get(method);
+            if (definition == null) {
                 return error(resp, id, RpcErrorCodes.METHOD_NOT_FOUND, "未知方法: " + method, null);
             }
             JsonObject params = req.has("params") && req.get("params").isJsonObject()
                     ? req.getAsJsonObject("params") : new JsonObject();
-            Object result = handler.apply(params);
+            Object result = definition.handler().apply(params);
             resp.add("result", GSON.toJsonTree(result));
         } catch (RpcException e) {
             // 预期业务错误：保留稳定错误码与 data

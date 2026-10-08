@@ -4,6 +4,8 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -133,5 +135,25 @@ class RpcDispatcherTest {
         JsonObject err = resp.getAsJsonObject("error");
         assertEquals(-32002, err.get("code").getAsInt());
         assertFalse(err.has("data"));
+    }
+
+    @Test
+    void methodDefinition注册后可路由且definitions含元数据() {
+        RpcDispatcher d = new RpcDispatcher();
+        d.register(MethodDefinition.of("echo2", "回显测试",
+                List.of(RpcParamSpec.required("word", "string", "要回显的词")),
+                params -> "回显:" + params.get("word").getAsString()));
+
+        // 元数据可通过 definitions() 取得
+        MethodDefinition def = d.definitions().iterator().next();
+        assertEquals("echo2", def.name());
+        assertEquals("回显测试", def.description());
+        assertEquals("word", def.params().get(0).name());
+        assertTrue(def.params().get(0).required());
+
+        // handle 能按定义路由
+        JsonObject resp = parse(d.handle(
+                "{\"jsonrpc\":\"2.0\",\"method\":\"echo2\",\"params\":{\"word\":\"你好\"},\"id\":11}"));
+        assertEquals("回显:你好", resp.get("result").getAsString());
     }
 }

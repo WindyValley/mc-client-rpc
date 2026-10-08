@@ -11,11 +11,14 @@ import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import top.windyvalley.mcclientrpc.McClientRpc;
+import top.windyvalley.mcclientrpc.protocol.MethodDefinition;
 import top.windyvalley.mcclientrpc.protocol.RpcDispatcher;
 import top.windyvalley.mcclientrpc.protocol.RpcErrorCodes;
 import top.windyvalley.mcclientrpc.protocol.RpcException;
+import top.windyvalley.mcclientrpc.protocol.RpcParamSpec;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
@@ -191,52 +194,110 @@ public final class ClientPlayerController {
 
     /** 把全部 RPC 方法注册到分发器。 */
     public void registerHandlers(RpcDispatcher d) {
-        d.register("methods.list", p -> methodsList(d));
+        // methods.list 本身也有定义
+        d.register(MethodDefinition.of("methods.list",
+                "列出所有已注册方法及其参数 schema",
+                List.of(), p -> methodsList(d)));
 
         // ── 进入世界前（自动化导航）──
-        registerClient(d, "client.status", 3000, p -> clientStatus());
-        registerClient(d, "client.toTitle", 3000, p -> toTitle());
-        registerClient(d, "client.connect", 8000,
-                p -> connect(required(p, "host"), (int) f(p, "port", 25565)));
-        registerClient(d, "client.disconnect", 3000, p -> disconnect());
+        registerClient(d, "client.status", "查询客户端当前界面与连接状态",
+                List.of(), 3000, p -> clientStatus());
+        registerClient(d, "client.toTitle", "强制切到主菜单，跳过拦路引导界面",
+                List.of(), 3000, p -> toTitle());
+        registerClient(d, "client.connect", "直连指定服务器（异步发起，用 client.status 轮询）",
+                List.of(RpcParamSpec.required("host", "string", "服务器地址（必传）"),
+                        RpcParamSpec.optional("port", "integer", 25565, "服务器端口")),
+                8000, p -> connect(required(p, "host"), (int) f(p, "port", 25565)));
+        registerClient(d, "client.disconnect", "断开当前连接，回到主菜单",
+                List.of(), 3000, p -> disconnect());
         // client.quit 不走任务队列：destroy 会终止 JVM，阻塞等 future 永远等不到。
-        d.register("client.quit", p -> quitGame());
+        d.register(MethodDefinition.of("client.quit", "完全退出客户端进程",
+                List.of(), p -> quitGame()));
 
         // ── 进入世界后（玩家操控）──
-        registerClient(d, "player.pos", 3000, p -> playerPos());
-        registerClient(d, "player.attack", 5000,
-                p -> attackNearest(str(p, "target", "zombie")));
+        registerClient(d, "player.pos", "查询玩家坐标、维度与血量",
+                List.of(), 3000, p -> playerPos());
+        registerClient(d, "player.attack", "在触及范围内攻击最近的指定类型实体",
+                List.of(RpcParamSpec.optional("target", "string", "zombie", "目标实体类型（精确匹配）")),
+                5000, p -> attackNearest(str(p, "target", "zombie")));
         // 高级指令跨多帧（寻路+攻击），不能走一帧式提交，见 runAttackNearest 注释。
-        d.register("player.attackNearest", p -> runAttackNearest(str(p, "target", "zombie")));
-        registerClient(d, "player.look", 3000,
-                p -> look(f(p, "yaw", 0), f(p, "pitch", 0)));
-        registerClient(d, "player.move", 3000,
-                p -> move(f(p, "forward", 0), f(p, "strafe", 0), bool(p, "jump", false)));
-        registerClient(d, "player.jump", 3000, p -> setJumpKey(bool(p, "down", true)));
-        registerClient(d, "player.moveToward", 3000,
-                p -> moveToward(str(p, "target", "zombie")));
-        registerClient(d, "player.stop", 3000, p -> stopMove());
-        registerClient(d, "player.state", 3000, p -> playerState());
-        registerClient(d, "player.respawn", 3000, p -> respawn());
-        registerClient(d, "player.command", 3000,
-                p -> sendCommand(str(p, "cmd", "")));
-        registerClient(d, "player.chat", 3000, p -> sendChat(str(p, "msg", "")));
-        registerClient(d, "world.entities", 3000, p -> listEntities(f(p, "radius", 32)));
+        d.register(MethodDefinition.of("player.attackNearest",
+                "自动寻路到目标并攻击（tick 驱动，15s 超时）",
+                List.of(RpcParamSpec.optional("target", "string", "zombie", "目标实体类型（精确匹配）")),
+                p -> runAttackNearest(str(p, "target", "zombie"))));
+        registerClient(d, "player.look", "设置玩家视角",
+                List.of(RpcParamSpec.optional("yaw", "float", 0, "水平角（-180~180）"),
+                        RpcParamSpec.optional("pitch", "float", 0, "俯仰角（-90~90）")),
+                3000, p -> look(f(p, "yaw", 0), f(p, "pitch", 0)));
+        registerClient(d, "player.move", "按下/释放方向键（持续生效，需 player.stop 释放）",
+                List.of(RpcParamSpec.optional("forward", "float", 0, "前后（>0 前进，<0 后退）"),
+                        RpcParamSpec.optional("strafe", "float", 0, "左右（>0 左移，<0 右移）"),
+                        RpcParamSpec.optional("jump", "boolean", false, "是否同时跳跃")),
+                3000, p -> move(f(p, "forward", 0), f(p, "strafe", 0), bool(p, "jump", false)));
+        registerClient(d, "player.jump", "按住/松开跳跃键",
+                List.of(RpcParamSpec.optional("down", "boolean", true, "true 按下，false 释放")),
+                3000, p -> setJumpKey(bool(p, "down", true)));
+        registerClient(d, "player.moveToward", "自动走向最近的指定类型实体",
+                List.of(RpcParamSpec.optional("target", "string", "zombie", "目标实体类型（精确匹配）")),
+                3000, p -> moveToward(str(p, "target", "zombie")));
+        registerClient(d, "player.stop", "停止持续移动并释放全部方向/跳跃键",
+                List.of(), 3000, p -> stopMove());
+        registerClient(d, "player.state", "查询玩家血量、位置、视角与死亡状态",
+                List.of(), 3000, p -> playerState());
+        registerClient(d, "player.respawn", "死亡后重生（等价点重生按钮）",
+                List.of(), 3000, p -> respawn());
+        registerClient(d, "player.command", "以玩家身份发送一条斜杠命令",
+                List.of(RpcParamSpec.required("cmd", "string", "不带 / 的命令文本")),
+                3000, p -> sendCommand(str(p, "cmd", "")));
+        registerClient(d, "player.chat", "以玩家身份发送一条普通聊天",
+                List.of(RpcParamSpec.required("msg", "string", "聊天文本")),
+                3000, p -> sendChat(str(p, "msg", "")));
+        registerClient(d, "world.entities", "列出周围指定半径内的生物",
+                List.of(RpcParamSpec.optional("radius", "float", 32, "搜索半径（格）")),
+                3000, p -> listEntities(f(p, "radius", 32)));
     }
 
     /**
-     * 统一注册一帧式方法：body 包进任务队列切到 render thread 执行，带超时。
+     * 统一注册一帧式方法：定义元数据 + body 包进任务队列切到 render thread 执行。
      * 消除每个方法重复的 submitOnClientThread 包装；body 抛出的 RpcException
      * 经队列边界透传，错误码不丢失。
      */
-    private void registerClient(RpcDispatcher d, String method, long timeoutMs,
+    private void registerClient(RpcDispatcher d, String method, String description,
+                                List<RpcParamSpec> params, long timeoutMs,
                                 Function<JsonObject, Object> body) {
-        d.register(method, params -> submitOnClientThread(() -> body.apply(params), timeoutMs));
+        d.register(MethodDefinition.of(method, description, params,
+                p -> submitOnClientThread(() -> body.apply(p), timeoutMs)));
     }
 
-    /** methods.list 的结果（保持方法名字符串形式，schema 化在后续批次处理）。 */
-    private static String methodsList(RpcDispatcher d) {
-        return String.join(", ", d.methods());
+    /**
+     * methods.list 的结构化结果：方法名、说明、参数 schema（名称/类型/必传/默认值/说明）。
+     * 是协议的自描述单一来源，API 文档可据此导出。
+     */
+    private static java.util.Map<String, Object> methodsList(RpcDispatcher d) {
+        java.util.List<java.util.Map<String, Object>> methods = new java.util.ArrayList<>();
+        for (MethodDefinition def : d.definitions()) {
+            java.util.List<java.util.Map<String, Object>> paramList = new java.util.ArrayList<>();
+            for (RpcParamSpec ps : def.params()) {
+                java.util.Map<String, Object> pm = new LinkedHashMap<>();
+                pm.put("name", ps.name());
+                pm.put("type", ps.type());
+                pm.put("required", ps.required());
+                if (!ps.required()) {
+                    pm.put("default", ps.defaultValue());
+                }
+                pm.put("description", ps.description());
+                paramList.add(pm);
+            }
+            java.util.Map<String, Object> mm = new LinkedHashMap<>();
+            mm.put("name", def.name());
+            mm.put("description", def.description());
+            mm.put("params", paramList);
+            methods.add(mm);
+        }
+        java.util.Map<String, Object> result = new LinkedHashMap<>();
+        result.put("count", methods.size());
+        result.put("methods", methods);
+        return result;
     }
 
     /**
