@@ -565,7 +565,7 @@ public final class ClientPlayerController {
             throw new RpcException(RpcErrorCodes.BUSY,
                     "已有进行中的攻击操作，请等待完成或稍后重试",
                     java.util.Map.of("currentTarget",
-                            attackSession.target().getType().toString()));
+                            entityTypeId(attackSession.target())));
         }
         Entity target = targetResolver.nearestByType(p, typeKey, 32.0);
         if (target == null) {
@@ -617,7 +617,7 @@ public final class ClientPlayerController {
         Float hpAfter = target instanceof net.minecraft.world.entity.LivingEntity le2
                 ? le2.getHealth() : null;
         java.util.Map<String, Object> m = new LinkedHashMap<>();
-        m.put("target", target.getType().toString());
+        m.put("target", entityTypeId(target));
         m.put("distance", round1(dist));
         m.put("reach", round1(reach));
         m.put("hpBefore", hpBefore);
@@ -691,7 +691,7 @@ public final class ClientPlayerController {
         // 到达触及距离后 tick 自动停止。这是真实走路（发移动包），不是瞬移。
         moveTarget = target;
         return String.format("开始走向 %s（当前 %.1f 格，触及 %.1f 格）——tick 驱动，到达自动停",
-                target.getType().toString(), dist, reach);
+                entityTypeId(target), dist, reach);
     }
 
     /** 停止移动（清持续目标 + 释放方向/跳跃键映射）。 */
@@ -712,7 +712,7 @@ public final class ClientPlayerController {
         for (Entity e : p.level().getEntities(p, p.getBoundingBox().inflate(radius),
                 x -> x instanceof net.minecraft.world.entity.LivingEntity)) {
             java.util.Map<String, Object> em = new LinkedHashMap<>();
-            em.put("type", e.getType().toString());
+            em.put("type", entityTypeId(e));
             em.put("x", round1(e.getX()));
             em.put("y", round1(e.getY()));
             em.put("z", round1(e.getZ()));
@@ -727,6 +727,12 @@ public final class ClientPlayerController {
     }
 
     // ── 工具 ─────────────────────────────────────────────────────
+
+    /** 实体的注册 ID（minecraft:zombie 形式），与 TargetResolver 接受的表示一致。 */
+    private static String entityTypeId(Entity e) {
+        return net.minecraft.core.registries.BuiltInRegistries.ENTITY_TYPE
+                .getKey(e.getType()).toString();
+    }
 
     private LocalPlayer requirePlayer() {
         LocalPlayer p = mc.player;
