@@ -10,8 +10,8 @@ architectury {
 loom {
     runs {
         client {
-            // 自动化测试：启动后直连测试服务器，离线用户名 Dev
-            programArgs "--quickPlayMultiplayer", "127.0.0.1:25565"
+            // 自动化测试：停在标题屏，由外部 RPC client.connect 主动连接。
+            // 不配 quickPlay——资源/Mod 未加载完时抢连会导致进服后跳回标题屏。
             programArgs "--username", "Dev"
             programArgs "--width", "854"
             programArgs "--height", "480"

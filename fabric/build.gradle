@@ -10,7 +10,7 @@ architectury {
 loom {
     runs {
         client {
-            programArgs "--quickPlayMultiplayer", "127.0.0.1:25565"
+            // 停在标题屏，由外部 RPC client.connect 主动连接（quickPlay 抢连会跳屏）。
             programArgs "--username", "Dev"
             programArgs "--width", "854"
             programArgs "--height", "480"
