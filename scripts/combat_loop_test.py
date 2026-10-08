@@ -89,8 +89,8 @@ class Step:
 step = Step()
 
 
-def rpc(method: str, params: dict | None = None, timeout: float = 8.0) -> str:
-    """发一条 JSON-RPC，返回 result 字符串；协议错误抛 RuntimeError。"""
+def rpc(method: str, params: dict | None = None, timeout: float = 8.0):
+    """发一条 JSON-RPC，返回 result（dict / str / 数值，按协议原样）；协议错误抛 RuntimeError。"""
     req: dict = {"jsonrpc": "2.0", "method": method, "id": 1}
     if params:
         req["params"] = params
@@ -116,8 +116,9 @@ def rpc(method: str, params: dict | None = None, timeout: float = 8.0) -> str:
     except ValueError:
         raise RuntimeError(f"RPC 响应非 JSON: {buf!r}")
     if "error" in resp:
-        raise RuntimeError(f"RPC {method} 错误: {resp['error'].get('message')}")
-    return str(resp.get("result", ""))
+        err = resp["error"]
+        raise RuntimeError(f"RPC {method} 错误 [{err.get('code')}]: {err.get('message')}")
+    return resp.get("result", "")
 
 
 def rpc_ok(method: str, params: dict | None = None, timeout: float = 8.0) -> bool:
@@ -180,17 +181,11 @@ def read_client_log() -> str:
         return ""
 
 
-def _parse_hp(state: str) -> float | None:
-    """从 player.state 文本解析玩家当前血量（'血量 20.0/20.0' → 20.0）。"""
-    import re
-    m = re.search(r"血量\s+([0-9.]+)/", state)
-    return float(m.group(1)) if m else None
-
-
 def _player_hp() -> float | None:
-    """查玩家当前血量（RPC player.state），失败返回 None。"""
+    """查玩家当前血量（RPC player.state，结构化结果），失败返回 None。"""
     try:
-        return _parse_hp(rpc("player.state", timeout=5))
+        state = rpc("player.state", timeout=5)
+        return float(state["health"])
     except Exception:
         return None
 
@@ -303,29 +298,30 @@ def main() -> int:
     step.ok(f"跳过引导屏: {r}")
 
     # 2. 连接服务器 + 轮询进世界
-    rpc("client.connect", {"host": "127.0.0.1", "port": 25565})
-    in_world = wait_until(
-        lambda: ("已进世界=true" in rpc("client.status", timeout=5),
-                 rpc("client.status", timeout=5)),
-        TIMEOUT_CONNECT,
-        desc="进世界",
-    )
+    rpc("client.connect", {"host": SERVER_HOST, "port": 25565})
+
+    def _in_world():
+        st = rpc("client.status", timeout=5)
+        return (bool(st["inWorld"]), f"screen={st['screen']} connected={st['connected']}")
+
+    in_world = wait_until(_in_world, TIMEOUT_CONNECT, desc="进世界")
     if not in_world:
         stop_client()
         raise step.fail(f"{TIMEOUT_CONNECT}s 内未进世界")
     step.ok("已进入世界（已连服务器）")
 
-    # 3. 若死亡则重生，确认活着满血
+    # 3. 若死亡则重生，确认活着
     state = rpc("player.state")
-    if "死亡 是" in state:
+    if state["dead"]:
         step.info("玩家死亡，重生……")
         rpc("player.respawn")
         time.sleep(2)
         state = rpc("player.state")
-    if "死亡 是" in state:
+    if state["dead"]:
         stop_client()
         raise step.fail("重生后仍死亡")
-    step.ok(f"玩家存活: {state}")
+    step.ok(f"玩家存活: 血量 {state['health']}/{state['maxHealth']} 位置 "
+            f"({state['x']},{state['y']},{state['z']})")
 
     # 4. OP 身份管理（恢复语义）：本用例测「普通玩家被反击」，需非 OP。
     #    进入前记录原 OP 状态，确保非 OP 进行测试，退出时恢复原状。
@@ -347,19 +343,21 @@ def main() -> int:
 
         # 6. 确认僵尸进入视野
         ents = rpc("world.entities", {"radius": 32})
-        if "zombie" not in ents:
+        zombie_ents = [e for e in ents["entities"] if "zombie" in e["type"]]
+        if not zombie_ents:
             raise step.fail(f"召唤后视野内无 zombie: {ents}")
-        step.ok(f"视野内确认目标: {ents.strip().splitlines()[-1] if ents.strip() else ents}")
+        step.ok(f"视野内确认目标: {zombie_ents[-1]}")
 
         # 6. moveToward 走近 → 轮询进入触及范围（此刻玩家已是普通身份）
         rpc("player.moveToward", {"target": "zombie"})
 
         def _in_reach():
             st = rpc("player.state", timeout=5)
-            if "死亡 是" in st:
+            if st["dead"]:
                 return True, "玩家已死亡（走近途中被反击）"  # 也算进入战斗
             en = rpc("world.entities", {"radius": 4}, timeout=5)
-            return ("zombie" in en, f"走近中…… 状态: {st[:50]}")
+            near = [e for e in en["entities"] if "zombie" in e["type"]]
+            return (bool(near), f"走近中…… 血量 {st['health']} 近处目标 {len(near)}")
 
         reached = wait_until(_in_reach, TIMEOUT_WALK, desc="走近")
         if not reached:
@@ -376,24 +374,24 @@ def main() -> int:
         hp0 = _player_hp()  # 战斗开始时玩家血量（基准）
         deadline = time.time() + TIMEOUT_RETALIATE
         while time.time() < deadline:
-            # 玩家状态：死亡 or 血量下降 都是反击证据
+            # 玩家状态：dead / health=0 / 血量下降 都是反击证据
             try:
                 st = rpc("player.state", timeout=5)
             except Exception:
                 break
-            if "死亡 是" in st or "血量 0.0" in st:
+            if st["dead"] or float(st["health"]) <= 0.0:
                 retaliated = True
-                step.info(f"玩家被反击致死: {st}")
+                step.info(f"玩家被反击致死: 血量 {st['health']} 位置 {st['x']},{st['y']},{st['z']}")
                 break
-            hp = _parse_hp(st)
-            if hp is not None and hp0 is not None and hp < hp0:
+            hp = float(st["health"])
+            if hp0 is not None and hp < hp0:
                 retaliated = True
-                step.info(f"玩家被反击掉血 {hp0} → {hp}（反击链生效）: {st}")
+                step.info(f"玩家被反击掉血 {hp0} → {hp}（反击链生效）")
                 break
             # 活着则继续打
             try:
                 atk = rpc("player.attack", {"target": "zombie"}, timeout=5)
-                step.info(atk)
+                step.info(f"攻击: {atk['target']} 距离 {atk['distance']} hit={atk['hit']}")
             except Exception as e:
                 step.info(f"攻击异常（可能目标已死/走远）: {e}")
             # 日志侧判定

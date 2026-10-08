@@ -18,6 +18,7 @@ import top.windyvalley.mcclientrpc.protocol.RpcDispatcher;
 import top.windyvalley.mcclientrpc.protocol.RpcErrorCodes;
 import top.windyvalley.mcclientrpc.protocol.RpcException;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -86,6 +87,13 @@ public final class ClientPlayerController {
             return "错误: 客户端线程执行超时（" + timeoutMs + "ms）——可能未进入世界或游戏卡顿";
         } catch (ExecutionException e) {
             Throwable cause = e.getCause() == null ? e : e.getCause();
+            // 业务异常透传，保留错误码与 data
+            if (cause instanceof RpcException re) {
+                throw re;
+            }
+            if (cause instanceof RuntimeException re2) {
+                throw re2;
+            }
             return "错误: " + cause.getClass().getSimpleName() + ": " + cause.getMessage();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -190,7 +198,7 @@ public final class ClientPlayerController {
         d.register("client.status", p -> submitOnClientThread(this::clientStatus, 3000));
         d.register("client.toTitle", p -> submitOnClientThread(this::toTitle, 3000));
         d.register("client.connect", p -> submitOnClientThread(
-                () -> connect(str(p, "host", "127.0.0.1"), (int) f(p, "port", 25565)), 8000));
+                () -> connect(required(p, "host"), (int) f(p, "port", 25565)), 8000));
         d.register("client.disconnect", p -> submitOnClientThread(this::disconnect, 3000));
         // 完全退出客户端进程（等价标题屏「退出」按钮 → Minecraft.destroy → System.exit）。
         // 不走 submitOnClientThread：destroy 会终止 JVM，阻塞等 future 永远等不到。
@@ -272,16 +280,20 @@ public final class ClientPlayerController {
     /**
      * 客户端当前状态 —— 自动化的「眼睛」。
      *
-     * <p>报告当前在哪个界面（主菜单/连接中/已进世界）、玩家是否就绪，
-     * 让外部脚本能判断「现在能不能发 player.* 指令」。
+     * <p>返回结构化对象：当前界面、是否在世界、连接状态与服务器地址。
+     * 让外部脚本直接读字段判断「现在能不能发 player.* 指令」，无需解析句子。
      */
-    private String clientStatus() {
-        String screen = mc.screen == null ? "无界面(游戏中)" : mc.screen.getClass().getSimpleName();
+    private java.util.Map<String, Object> clientStatus() {
+        String screen = mc.screen == null ? null : mc.screen.getClass().getSimpleName();
         boolean inWorld = mc.player != null && mc.level != null;
         boolean connected = mc.getConnection() != null && mc.getConnection().getConnection().isConnected();
-        String server = connected && mc.getCurrentServer() != null ? mc.getCurrentServer().ip : "无";
-        return String.format("界面=%s | 已进世界=%s | 已连服务器=%s | 服务器=%s",
-                screen, inWorld, connected, server);
+        String server = connected && mc.getCurrentServer() != null ? mc.getCurrentServer().ip : null;
+        java.util.Map<String, Object> m = new LinkedHashMap<>();
+        m.put("screen", screen);
+        m.put("inWorld", inWorld);
+        m.put("connected", connected);
+        m.put("server", server);
+        return m;
     }
 
     /**
@@ -377,21 +389,36 @@ public final class ClientPlayerController {
 
     // ── 操控实现（都在 render thread 执行）─────────────────────────
 
-    private String playerPos() {
+    private java.util.Map<String, Object> playerPos() {
         LocalPlayer p = requirePlayer();
-        return String.format("玩家 %s 位于 (%.1f, %.1f, %.1f) 维度 %s 血量 %.1f/%.1f",
-                p.getName().getString(), p.getX(), p.getY(), p.getZ(),
-                p.level().dimension().location(), p.getHealth(), p.getMaxHealth());
+        java.util.Map<String, Object> m = new LinkedHashMap<>();
+        m.put("name", p.getName().getString());
+        m.put("x", round1(p.getX()));
+        m.put("y", round1(p.getY()));
+        m.put("z", round1(p.getZ()));
+        m.put("dimension", p.level().dimension().location().toString());
+        m.put("health", p.getHealth());
+        m.put("maxHealth", p.getMaxHealth());
+        return m;
     }
 
-    private String playerState() {
+    private java.util.Map<String, Object> playerState() {
         LocalPlayer p = requirePlayer();
-        return String.format("玩家 %s | 血量 %.1f/%.1f | 位置 (%.1f,%.1f,%.1f) | 准星指向 %s | 地面 %s | 死亡 %s",
-                p.getName().getString(), p.getHealth(), p.getMaxHealth(),
-                p.getX(), p.getY(), p.getZ(),
-                mc.hitResult == null ? "无" : mc.hitResult.getType(),
-                p.onGround() ? "是" : "否",
-                p.isDeadOrDying() ? "是(需respawn)" : "否");
+        java.util.Map<String, Object> m = new LinkedHashMap<>();
+        m.put("name", p.getName().getString());
+        m.put("health", p.getHealth());
+        m.put("maxHealth", p.getMaxHealth());
+        m.put("x", round1(p.getX()));
+        m.put("y", round1(p.getY()));
+        m.put("z", round1(p.getZ()));
+        m.put("hitResult", mc.hitResult == null ? null : mc.hitResult.getType().toString());
+        m.put("onGround", p.onGround());
+        m.put("dead", p.isDeadOrDying());
+        return m;
+    }
+
+    private static double round1(double v) {
+        return Math.round(v * 10.0) / 10.0;
     }
 
     /**
@@ -423,7 +450,7 @@ public final class ClientPlayerController {
     private String sendCommand(String cmd) {
         LocalPlayer p = requirePlayer();
         if (cmd == null || cmd.isBlank()) {
-            return "错误: 缺少 cmd 参数";
+            throw new RpcException(RpcErrorCodes.INVALID_PARAMS, "缺少必传参数: cmd");
         }
         String c = cmd.startsWith("/") ? cmd.substring(1) : cmd;
         p.connection.sendCommand(c);
@@ -437,7 +464,7 @@ public final class ClientPlayerController {
     private String sendChat(String msg) {
         LocalPlayer p = requirePlayer();
         if (msg == null || msg.isBlank()) {
-            return "错误: 缺少 msg 参数";
+            throw new RpcException(RpcErrorCodes.INVALID_PARAMS, "缺少必传参数: msg");
         }
         p.connection.sendChat(msg);
         return "已发送聊天: " + msg;
@@ -473,23 +500,28 @@ public final class ClientPlayerController {
      * <p>先把视角对准目标，再调 {@code mc.gameMode.attack(player, entity)}
      * 走真实攻击管线（发 ServerboundInteractPacket 攻击包），并挥臂。
      * 这正是真人点击鼠标左键的效果，区别于服务端伪造伤害来源。
+     *
+     * <p>返回结构化对象：目标类型、距离、触及距离、攻击前后血量与命中判定。
+     * 超出触及距离时抛 OUT_OF_REACH，data 携带 distance / reach。
      */
-    private String attackNearest(String typeKey) {
+    private java.util.Map<String, Object> attackNearest(String typeKey) {
         LocalPlayer p = requirePlayer();
         Entity target = nearestEntity(p, typeKey, 32.0);
         if (target == null) {
-            return "错误: 附近 32 格内无 " + typeKey;
+            throw new RpcException(RpcErrorCodes.TARGET_NOT_FOUND,
+                    "附近 " + 32 + " 格内无 " + typeKey,
+                    java.util.Map.of("target", typeKey, "radius", 32));
         }
         if (mc.gameMode == null) {
-            return "错误: gameMode 未就绪（不在多人游戏？）";
+            throw new RpcException(RpcErrorCodes.NOT_READY, "gameMode 未就绪（不在多人游戏？）");
         }
         double dist = p.distanceTo(target);
         // 触及距离守卫：生存模式玩家触及约 3 格（实体判定 + 服务端校验）。
-        // 超出时服务端会判定挥空，攻击包发了但不掉血——此前「打了不掉血」即此因。
-        double reach = p.entityInteractionRange(); // 玩家实体触及距离（属性系统，生存默认3格）
+        double reach = p.entityInteractionRange();
         if (dist > reach) {
-            return String.format("错误: %s 距离 %.1f 格，超出触及范围 %.1f 格——需先 player.move 走近",
-                    target.getType().toString(), dist, reach);
+            throw new RpcException(RpcErrorCodes.OUT_OF_REACH,
+                    "目标超出触及距离，需先走近",
+                    java.util.Map.of("distance", round1(dist), "reach", round1(reach)));
         }
         // 攻击前血量（LivingEntity 才有，用于命中判定）
         Float hpBefore = target instanceof net.minecraft.world.entity.LivingEntity le
@@ -502,12 +534,14 @@ public final class ClientPlayerController {
         // 命中判定：客户端预测血量（服务端权威，客户端血量稍后同步）
         Float hpAfter = target instanceof net.minecraft.world.entity.LivingEntity le2
                 ? le2.getHealth() : null;
-        String hitInfo = (hpBefore != null && hpAfter != null)
-                ? String.format(" 血量 %.1f→%.1f %s", hpBefore, hpAfter,
-                        hpAfter < hpBefore ? "(已命中)" : "(未掉血-可能挥空/无敌帧)")
-                : "";
-        return String.format("已攻击 %s (距离 %.1f 格) —— 真实输入路径%s",
-                target.getType().toString(), dist, hitInfo);
+        java.util.Map<String, Object> m = new LinkedHashMap<>();
+        m.put("target", target.getType().toString());
+        m.put("distance", round1(dist));
+        m.put("reach", round1(reach));
+        m.put("hpBefore", hpBefore);
+        m.put("hpAfter", hpAfter);
+        m.put("hit", hpBefore != null && hpAfter != null && hpAfter < hpBefore);
+        return m;
     }
 
     private String look(float yaw, float pitch) {
@@ -562,7 +596,9 @@ public final class ClientPlayerController {
         LocalPlayer p = requirePlayer();
         Entity target = nearestEntity(p, typeKey, 32.0);
         if (target == null) {
-            return "错误: 附近 32 格内无 " + typeKey;
+            throw new RpcException(RpcErrorCodes.TARGET_NOT_FOUND,
+                    "附近 " + 32 + " 格内无 " + typeKey,
+                    java.util.Map.of("target", typeKey, "radius", 32));
         }
         double reach = p.entityInteractionRange();
         double dist = p.distanceTo(target);
@@ -588,15 +624,24 @@ public final class ClientPlayerController {
         return "移动已停止";
     }
 
-    private String listEntities(float radius) {
+    private java.util.Map<String, Object> listEntities(float radius) {
         LocalPlayer p = requirePlayer();
-        StringBuilder sb = new StringBuilder("周围 " + radius + " 格内生物:\n");
+        java.util.List<java.util.Map<String, Object>> entities = new java.util.ArrayList<>();
         for (Entity e : p.level().getEntities(p, p.getBoundingBox().inflate(radius),
                 x -> x instanceof net.minecraft.world.entity.LivingEntity)) {
-            sb.append(String.format("- %s (%.1f,%.1f,%.1f) 距离 %.1f\n",
-                    e.getType().toString(), e.getX(), e.getY(), e.getZ(), p.distanceTo(e)));
+            java.util.Map<String, Object> em = new LinkedHashMap<>();
+            em.put("type", e.getType().toString());
+            em.put("x", round1(e.getX()));
+            em.put("y", round1(e.getY()));
+            em.put("z", round1(e.getZ()));
+            em.put("distance", round1(p.distanceTo(e)));
+            entities.add(em);
         }
-        return sb.toString();
+        java.util.Map<String, Object> m = new LinkedHashMap<>();
+        m.put("radius", radius);
+        m.put("count", entities.size());
+        m.put("entities", entities);
+        return m;
     }
 
     // ── 工具 ─────────────────────────────────────────────────────
@@ -638,6 +683,18 @@ public final class ClientPlayerController {
 
     private static String str(JsonObject p, String k, String def) {
         return p.has(k) ? p.get(k).getAsString() : def;
+    }
+
+    /** 取必传字符串参数：缺失 / 空白 / 类型错一律抛 INVALID_PARAMS，不静默使用默认值。 */
+    private static String required(JsonObject p, String k) {
+        if (!p.has(k) || p.get(k).isJsonNull()) {
+            throw new RpcException(RpcErrorCodes.INVALID_PARAMS, "缺少必传参数: " + k);
+        }
+        String v = p.get(k).getAsString();
+        if (v == null || v.isBlank()) {
+            throw new RpcException(RpcErrorCodes.INVALID_PARAMS, "参数不能为空: " + k);
+        }
+        return v;
     }
 
     private static float f(JsonObject p, String k, float def) {
