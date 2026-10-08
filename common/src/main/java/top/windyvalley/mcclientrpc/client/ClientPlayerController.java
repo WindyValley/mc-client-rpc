@@ -4,27 +4,24 @@ import com.google.gson.JsonObject;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.ConnectScreen;
-import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.TitleScreen;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.resolver.ServerAddress;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.phys.EntityHitResult;
-import net.minecraft.world.phys.HitResult;
 import top.windyvalley.mcclientrpc.McClientRpc;
 import top.windyvalley.mcclientrpc.protocol.RpcDispatcher;
 import top.windyvalley.mcclientrpc.protocol.RpcErrorCodes;
 import top.windyvalley.mcclientrpc.protocol.RpcException;
 
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -56,6 +53,8 @@ public final class ClientPlayerController {
     private final ConcurrentLinkedQueue<ClientTask> queue = new ConcurrentLinkedQueue<>();
 
     private final Minecraft mc = Minecraft.getInstance();
+
+    private final TargetResolver targetResolver = new TargetResolver();
 
     /** 持续移动目标：非空时 tick() 每帧朝它前进并瞄准，跑赢 input.tick() 的键盘覆盖。 */
     private volatile Entity moveTarget;
@@ -192,87 +191,102 @@ public final class ClientPlayerController {
 
     /** 把全部 RPC 方法注册到分发器。 */
     public void registerHandlers(RpcDispatcher d) {
-        d.register("methods.list", p -> String.join(", ", d.methods()));
+        d.register("methods.list", p -> methodsList(d));
 
         // ── 进入世界前（自动化导航）──
-        d.register("client.status", p -> submitOnClientThread(this::clientStatus, 3000));
-        d.register("client.toTitle", p -> submitOnClientThread(this::toTitle, 3000));
-        d.register("client.connect", p -> submitOnClientThread(
-                () -> connect(required(p, "host"), (int) f(p, "port", 25565)), 8000));
-        d.register("client.disconnect", p -> submitOnClientThread(this::disconnect, 3000));
-        // 完全退出客户端进程（等价标题屏「退出」按钮 → Minecraft.destroy → System.exit）。
-        // 不走 submitOnClientThread：destroy 会终止 JVM，阻塞等 future 永远等不到。
-        // 立即返回应答，500ms 后在 render thread 执行 destroy（留时间把响应写回 socket）。
+        registerClient(d, "client.status", 3000, p -> clientStatus());
+        registerClient(d, "client.toTitle", 3000, p -> toTitle());
+        registerClient(d, "client.connect", 8000,
+                p -> connect(required(p, "host"), (int) f(p, "port", 25565)));
+        registerClient(d, "client.disconnect", 3000, p -> disconnect());
+        // client.quit 不走任务队列：destroy 会终止 JVM，阻塞等 future 永远等不到。
         d.register("client.quit", p -> quitGame());
 
         // ── 进入世界后（玩家操控）──
-        d.register("player.pos", p -> submitOnClientThread(this::playerPos, 3000));
-        d.register("player.attack", p -> submitOnClientThread(() -> attackNearest(str(p, "target", "zombie")), 5000));
-        // 高级指令:自动寻路到目标 → 进入触及范围 → 攻击(参考怪物 MeleeAttackGoal)
-        // 不能用 submitOnClientThread 里阻塞 future.get()——那会卡死 render thread,
-        // tick() 的攻击段永远没机会跑(死锁)。
-        // 正确做法:RPC 线程先提交一个瞬间完成的「开启会话」任务,
-        // render thread 继续 tick 处理寻路+攻击,完成后 complete future。
-        d.register("player.attackNearest", p -> {
-            String typeKey = str(p, "target", "zombie");
-            CompletableFuture<Object> resultFuture = new CompletableFuture<>();
-            CompletableFuture<Object> setupFuture = new CompletableFuture<>();
-            // 快速任务:在 render thread 开启攻击会话(瞬间完成)
-            queue.add(new ClientTask(() -> {
-                startAttackSession(typeKey, resultFuture);
-                return "已锁定目标";
-            }, setupFuture));
-            // 等设置任务跑完(会话是否成功开启;忙 / 找不到目标在此抛出)
-            try {
-                setupFuture.get(5, TimeUnit.SECONDS);
-            } catch (TimeoutException e) {
-                return "错误: 客户端线程执行超时(5s)——可能未进入世界或游戏卡顿";
-            } catch (ExecutionException e) {
-                Throwable cause = e.getCause() == null ? e : e.getCause();
-                if (cause instanceof RpcException re) {
-                    throw re;
+        registerClient(d, "player.pos", 3000, p -> playerPos());
+        registerClient(d, "player.attack", 5000,
+                p -> attackNearest(str(p, "target", "zombie")));
+        // 高级指令跨多帧（寻路+攻击），不能走一帧式提交，见 runAttackNearest 注释。
+        d.register("player.attackNearest", p -> runAttackNearest(str(p, "target", "zombie")));
+        registerClient(d, "player.look", 3000,
+                p -> look(f(p, "yaw", 0), f(p, "pitch", 0)));
+        registerClient(d, "player.move", 3000,
+                p -> move(f(p, "forward", 0), f(p, "strafe", 0), bool(p, "jump", false)));
+        registerClient(d, "player.jump", 3000, p -> setJumpKey(bool(p, "down", true)));
+        registerClient(d, "player.moveToward", 3000,
+                p -> moveToward(str(p, "target", "zombie")));
+        registerClient(d, "player.stop", 3000, p -> stopMove());
+        registerClient(d, "player.state", 3000, p -> playerState());
+        registerClient(d, "player.respawn", 3000, p -> respawn());
+        registerClient(d, "player.command", 3000,
+                p -> sendCommand(str(p, "cmd", "")));
+        registerClient(d, "player.chat", 3000, p -> sendChat(str(p, "msg", "")));
+        registerClient(d, "world.entities", 3000, p -> listEntities(f(p, "radius", 32)));
+    }
+
+    /**
+     * 统一注册一帧式方法：body 包进任务队列切到 render thread 执行，带超时。
+     * 消除每个方法重复的 submitOnClientThread 包装；body 抛出的 RpcException
+     * 经队列边界透传，错误码不丢失。
+     */
+    private void registerClient(RpcDispatcher d, String method, long timeoutMs,
+                                Function<JsonObject, Object> body) {
+        d.register(method, params -> submitOnClientThread(() -> body.apply(params), timeoutMs));
+    }
+
+    /** methods.list 的结果（保持方法名字符串形式，schema 化在后续批次处理）。 */
+    private static String methodsList(RpcDispatcher d) {
+        return String.join(", ", d.methods());
+    }
+
+    /**
+     * 高级指令：自动寻路到目标 → 进入触及范围 → 攻击。
+     *
+     * <p>跨多帧操作不能用一帧式 submit：若在 render thread 上阻塞等结果，
+     * tick() 的攻击段永远没机会跑，形成死锁。因此：RPC 线程先提交一个瞬间
+     * 完成的「开启会话」任务，之后在 RPC 线程阻塞等结果；render thread
+     * 不阻塞，继续 tick 驱动寻路与攻击。
+     */
+    private Object runAttackNearest(String typeKey) {
+        CompletableFuture<Object> resultFuture = new CompletableFuture<>();
+        CompletableFuture<Object> setupFuture = new CompletableFuture<>();
+        queue.add(new ClientTask(() -> {
+            startAttackSession(typeKey, resultFuture);
+            return "已锁定目标";
+        }, setupFuture));
+        try {
+            setupFuture.get(5, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            return "错误: 客户端线程执行超时(5s)——可能未进入世界或游戏卡顿";
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() == null ? e : e.getCause();
+            if (cause instanceof RpcException re) {
+                throw re;
+            }
+            throw new RpcException(RpcErrorCodes.INTERNAL_ERROR,
+                    "开启攻击会话失败: " + cause.getMessage());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "错误: 等待被中断";
+        }
+        try {
+            return resultFuture.get(15000, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            // 超时只在 render thread 清理自己的会话（无返回通道，不造 future）
+            clientRunnables.add(() -> {
+                if (attackSession != null && attackSession.future() == resultFuture) {
+                    attackSession = null;
+                    moveTarget = null;
                 }
-                throw new RpcException(RpcErrorCodes.INTERNAL_ERROR,
-                        "开启攻击会话失败: " + cause.getMessage());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return "错误: 等待被中断";
-            }
-            // RPC 线程上阻塞等结果(render thread 不阻塞,继续 tick)
-            try {
-                return resultFuture.get(15000, TimeUnit.MILLISECONDS);
-            } catch (TimeoutException e) {
-                // 超时只在 render thread 清理自己的会话(无返回通道,不造 future)
-                clientRunnables.add(() -> {
-                    if (attackSession != null && attackSession.future() == resultFuture) {
-                        attackSession = null;
-                        moveTarget = null;
-                    }
-                });
-                return "错误: 攻击超时(15s)——可能目标太远/找不到路径";
-            } catch (ExecutionException e) {
-                Throwable cause = e.getCause() == null ? e : e.getCause();
-                return "错误: " + cause.getClass().getSimpleName() + ": " + cause.getMessage();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return "错误: 等待被中断";
-            }
-        });
-        d.register("player.look", p -> submitOnClientThread(
-                () -> look(f(p, "yaw", 0), f(p, "pitch", 0)), 3000));
-        d.register("player.move", p -> submitOnClientThread(
-                () -> move(f(p, "forward", 0), f(p, "strafe", 0), bool(p, "jump", false)), 3000));
-        d.register("player.jump", p -> submitOnClientThread(
-                () -> setJumpKey(bool(p, "down", true)), 3000));
-        d.register("player.moveToward", p -> submitOnClientThread(
-                () -> moveToward(str(p, "target", "zombie")), 3000));
-        d.register("player.stop", p -> submitOnClientThread(this::stopMove, 3000));
-        d.register("player.state", p -> submitOnClientThread(this::playerState, 3000));
-        d.register("player.respawn", p -> submitOnClientThread(this::respawn, 3000));
-        d.register("player.command", p -> submitOnClientThread(() -> sendCommand(str(p, "cmd", "")), 3000));
-        d.register("player.chat", p -> submitOnClientThread(() -> sendChat(str(p, "msg", "")), 3000));
-        d.register("world.entities", p -> submitOnClientThread(
-                () -> listEntities(f(p, "radius", 32)), 3000));
+            });
+            return "错误: 攻击超时(15s)——可能目标太远/找不到路径";
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() == null ? e : e.getCause();
+            return "错误: " + cause.getClass().getSimpleName() + ": " + cause.getMessage();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "错误: 等待被中断";
+        }
     }
 
     // ── 进入世界前：自动化导航 ─────────────────────────────────────
@@ -485,7 +499,7 @@ public final class ClientPlayerController {
                     java.util.Map.of("currentTarget",
                             attackSession.target().getType().toString()));
         }
-        Entity target = nearestEntity(p, typeKey, 32.0);
+        Entity target = targetResolver.nearestByType(p, typeKey, 32.0);
         if (target == null) {
             throw new RpcException(RpcErrorCodes.TARGET_NOT_FOUND,
                     "附近 " + 32 + " 格内无 " + typeKey,
@@ -506,7 +520,7 @@ public final class ClientPlayerController {
      */
     private java.util.Map<String, Object> attackNearest(String typeKey) {
         LocalPlayer p = requirePlayer();
-        Entity target = nearestEntity(p, typeKey, 32.0);
+        Entity target = targetResolver.nearestByType(p, typeKey, 32.0);
         if (target == null) {
             throw new RpcException(RpcErrorCodes.TARGET_NOT_FOUND,
                     "附近 " + 32 + " 格内无 " + typeKey,
@@ -594,7 +608,7 @@ public final class ClientPlayerController {
      */
     private String moveToward(String typeKey) {
         LocalPlayer p = requirePlayer();
-        Entity target = nearestEntity(p, typeKey, 32.0);
+        Entity target = targetResolver.nearestByType(p, typeKey, 32.0);
         if (target == null) {
             throw new RpcException(RpcErrorCodes.TARGET_NOT_FOUND,
                     "附近 " + 32 + " 格内无 " + typeKey,
@@ -652,21 +666,6 @@ public final class ClientPlayerController {
             throw new RpcException(RpcErrorCodes.NOT_READY, "玩家未进入世界");
         }
         return p;
-    }
-
-    private Entity nearestEntity(LocalPlayer p, String typeKey, double radius) {
-        List<Entity> list = p.level().getEntities(p, p.getBoundingBox().inflate(radius),
-                e -> e.getType().toString().contains(typeKey));
-        Entity best = null;
-        double bestDist = Double.MAX_VALUE;
-        for (Entity e : list) {
-            double d = p.distanceTo(e);
-            if (d < bestDist) {
-                bestDist = d;
-                best = e;
-            }
-        }
-        return best;
     }
 
     /** 把玩家视角转向目标实体（计算 yaw/pitch）。 */
