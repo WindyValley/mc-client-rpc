@@ -92,6 +92,25 @@ public final class ClientPlayerController {
 
     private final java.util.List<PendingHit> pendingHits = new java.util.ArrayList<>();
 
+    /**
+     * 延迟开屏判定：右键交互已真实发包，等若干 tick 让服务端回
+     * ClientboundOpenScreenPacket 后再读 {@code mc.screen}，判定交易 GUI
+     * 是否真的打开。同攻击命中判定，屏幕状态也是服务端权威、跨 tick 才同步。
+     */
+    private record PendingInteraction(Entity target, String clientResult,
+                                     java.util.Map<String, Object> result,
+                                     CompletableFuture<Object> future,
+                                     boolean autoClose, int ticksLeft) {
+        PendingInteraction tickDown() {
+            return new PendingInteraction(target, clientResult, result, future, autoClose, ticksLeft - 1);
+        }
+    }
+
+    /** 右键后等待服务端开屏同步的 tick 数（5 tick ≈ 250ms）。 */
+    private static final int SCREEN_CHECK_DELAY_TICKS = 5;
+
+    private final java.util.List<PendingInteraction> pendingInteractions = new java.util.ArrayList<>();
+
     /** 无返回任务队列：只需要在 render thread 执行副作用（如取消），不产生结果。 */
     private final ConcurrentLinkedQueue<Runnable> clientRunnables = new ConcurrentLinkedQueue<>();
 
@@ -224,6 +243,42 @@ public final class ClientPlayerController {
             pendingHits.clear();
             pendingHits.addAll(next);
         }
+
+        // 5. 延迟开屏判定：倒计 tick，到期读当前屏幕，确认服务端是否真打开了交易 GUI。
+        if (!pendingInteractions.isEmpty()) {
+            java.util.Iterator<PendingInteraction> it2 = pendingInteractions.iterator();
+            java.util.List<PendingInteraction> next2 = new java.util.ArrayList<>();
+            while (it2.hasNext()) {
+                PendingInteraction pi = it2.next();
+                CompletableFuture<Object> f = pi.future();
+                if (f.isDone()) {
+                    continue;
+                }
+                if (pi.ticksLeft() <= 1) {
+                    var screen = mc.screen;
+                    boolean merchantOpen = screen instanceof net.minecraft.client.gui.screens.inventory.MerchantScreen;
+                    int offerCount = -1;
+                    if (merchantOpen) {
+                        var offers = ((net.minecraft.client.gui.screens.inventory.MerchantScreen) screen)
+                                .getMenu().getOffers();
+                        offerCount = offers == null ? 0 : offers.size();
+                    }
+                    java.util.Map<String, Object> m = pi.result();
+                    m.put("screenOpen", merchantOpen);
+                    m.put("screenClass", screen == null ? "null" : screen.getClass().getSimpleName());
+                    m.put("offerCount", offerCount);
+                    // 判定完自动关窗（发容器关闭包），便于连续用例；保留玩家视角与位置不变
+                    if (pi.autoClose() && merchantOpen) {
+                        mc.setScreen(null);
+                    }
+                    f.complete(m);
+                } else {
+                    next2.add(pi.tickDown());
+                }
+            }
+            pendingInteractions.clear();
+            pendingInteractions.addAll(next2);
+        }
     }
 
     /** 把全部 RPC 方法注册到分发器。 */
@@ -254,6 +309,12 @@ public final class ClientPlayerController {
         registerClientDeferred(d, "player.attack", "在触及范围内攻击最近的指定类型实体",
                 List.of(RpcParamSpec.optional("target", "string", "zombie", "目标实体类型（精确匹配）")),
                 6000, p -> future -> performAttackDeferred(str(p, "target", "zombie"), future));
+        registerClientDeferred(d, "player.interact", "右键（使用）最近的指定类型实体，返回是否打开了交易界面",
+                List.of(RpcParamSpec.optional("target", "string", "zombie", "目标实体类型（精确匹配）"),
+                        RpcParamSpec.optional("autoClose", "boolean", true, "验完是否自动关闭界面（默认 true）")),
+                8000, p -> future -> performInteractDeferred(
+                        str(p, "target", "zombie"),
+                        bool(p, "autoClose", true), future));
         // 高级指令跨多帧（寻路+攻击），不能走一帧式提交，见 runAttackNearest 注释。
         d.register(MethodDefinition.of("player.attackNearest",
                 "自动寻路到目标并攻击（tick 驱动，15s 超时）",
@@ -700,6 +761,50 @@ public final class ClientPlayerController {
         m.put("hpAfter", hpAfter);
         m.put("hit", hpAfter < hpBefore);
         return m;
+    }
+
+    /**
+     * 右键最近目标的延迟动作：真实发包后登记 {@link PendingInteraction}，
+     * 由 tick() 在服务端开屏包到达后读屏幕状态完成 future。
+     */
+    private void performInteractDeferred(String typeKey, boolean autoClose,
+                                         CompletableFuture<Object> future) {
+        LocalPlayer p = requirePlayer();
+        Entity target = targetResolver.nearestByType(p, typeKey, 32.0);
+        if (target == null) {
+            future.completeExceptionally(new RpcException(RpcErrorCodes.TARGET_NOT_FOUND,
+                    "附近 " + 32 + " 格内无 " + typeKey,
+                    java.util.Map.of("target", typeKey, "radius", 32)));
+            return;
+        }
+        if (mc.gameMode == null) {
+            future.completeExceptionally(new RpcException(
+                    RpcErrorCodes.NOT_READY, "gameMode 未就绪（不在多人游戏？）"));
+            return;
+        }
+        double dist = p.distanceTo(target);
+        double reach = p.entityInteractionRange();
+        if (dist > reach) {
+            future.completeExceptionally(new RpcException(RpcErrorCodes.OUT_OF_REACH,
+                    "目标超出触及距离，需先走近",
+                    java.util.Map.of("distance", round1(dist), "reach", round1(reach))));
+            return;
+        }
+        // 真实右键路径：与真人右键同一调用 —— MultiPlayerGameMode.interact
+        // 发 ServerboundInteractPacket(INTERACT, MAIN_HAND)，并做客户端预测。
+        aimAt(p, target);
+        net.minecraft.world.InteractionResult result =
+                mc.gameMode.interact(p, target, InteractionHand.MAIN_HAND);
+        p.swing(InteractionHand.MAIN_HAND);
+
+        java.util.Map<String, Object> m = new LinkedHashMap<>();
+        m.put("target", entityTypeId(target));
+        m.put("distance", round1(dist));
+        m.put("reach", round1(reach));
+        m.put("clientResult", result == null ? "null" : result.toString());
+        pendingInteractions.add(new PendingInteraction(
+                target, result == null ? "null" : result.toString(), m,
+                future, autoClose, SCREEN_CHECK_DELAY_TICKS));
     }
 
     private String look(float yaw, float pitch) {
