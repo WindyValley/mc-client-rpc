@@ -352,6 +352,11 @@ public final class ClientPlayerController {
         registerClient(d, "world.entities", "列出周围指定半径内的生物",
                 List.of(RpcParamSpec.optional("radius", "float", 32, "搜索半径（格）")),
                 3000, p -> listEntities(f(p, "radius", 32)));
+        registerClient(d, "player.useBed", "右键指定坐标的床尝试睡觉（真实 useItemOn 发包，需夜晚、附近无敌对生物）",
+                List.of(RpcParamSpec.required("x", "integer", "床方块 x"),
+                        RpcParamSpec.required("y", "integer", "床方块 y"),
+                        RpcParamSpec.required("z", "integer", "床方块 z")),
+                8000, p -> useBed((int) f(p, "x", 0), (int) f(p, "y", 0), (int) f(p, "z", 0)));
 
         // ── 交易 GUI（须先用 player.interact 打开怪物交易界面，autoClose=false）──
         registerClient(d, "trade.status", "读取当前交易菜单：每条报价 uses/限购/售罄、货币槽、结果槽",
@@ -948,6 +953,43 @@ public final class ClientPlayerController {
         p.setYRot(yaw);
         p.setXRot(pitch);
         return String.format("视角已设为 yaw=%.1f pitch=%.1f", yaw, pitch);
+    }
+
+    /**
+     * 右键床尝试睡觉。走真实 {@code mc.gameMode.useItemOn}（发 ServerboundUseItemOnPacket），
+     * 与真人右键床同路径。要求：夜晚、床在触及范围内、附近无敌对生物（BedBlock 校验
+     * 10 格内 Enemy）。是否成功/过夜由调用方据服务端时间/睡眠状态轮询。
+     */
+    private java.util.Map<String, Object> useBed(int x, int y, int z) {
+        LocalPlayer p = requirePlayer();
+        if (mc.gameMode == null) {
+            throw new RpcException(RpcErrorCodes.NOT_READY, "gameMode 未就绪（不在多人游戏？）");
+        }
+        net.minecraft.core.BlockPos pos = new net.minecraft.core.BlockPos(x, y, z);
+        net.minecraft.world.phys.Vec3 hitVec = new net.minecraft.world.phys.Vec3(x + 0.5, y + 0.5625, z + 0.5);
+        double dist = Math.sqrt(p.distanceToSqr(hitVec));
+        double reach = p.blockInteractionRange();
+        if (dist > reach) {
+            throw new RpcException(RpcErrorCodes.OUT_OF_REACH, "床超出触及距离，需先走近",
+                    java.util.Map.of("distance", round1(dist), "reach", round1(reach)));
+        }
+        // 强制视线对准床顶面，保证服务端按玩家视角重做 raycast 时也命中该床格
+        net.minecraft.world.phys.Vec3 eye = p.getEyePosition(1.0f);
+        double dx = hitVec.x - eye.x, dy = hitVec.y - eye.y, dz = hitVec.z - eye.z;
+        double horiz = Math.sqrt(dx * dx + dz * dz);
+        p.setXRot((float) (-Math.toDegrees(Math.atan2(dy, horiz))));
+        p.setYRot((float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0));
+        net.minecraft.world.phys.BlockHitResult hit = new net.minecraft.world.phys.BlockHitResult(
+                hitVec, net.minecraft.core.Direction.UP, pos, false);
+        net.minecraft.world.InteractionResult result =
+                mc.gameMode.useItemOn(p, InteractionHand.MAIN_HAND, hit);
+        p.swing(InteractionHand.MAIN_HAND);
+        java.util.Map<String, Object> m = new LinkedHashMap<>();
+        m.put("bed", x + " " + y + " " + z);
+        m.put("distance", round1(dist));
+        m.put("clientResult", result == null ? "null" : result.toString());
+        m.put("isSleeping", p.isSleeping());
+        return m;
     }
 
     private String move(float forward, float strafe, boolean jump) {
