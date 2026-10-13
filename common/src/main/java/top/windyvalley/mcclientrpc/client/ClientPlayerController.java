@@ -267,9 +267,11 @@ public final class ClientPlayerController {
                     m.put("screenOpen", merchantOpen);
                     m.put("screenClass", screen == null ? "null" : screen.getClass().getSimpleName());
                     m.put("offerCount", offerCount);
-                    // 判定完自动关窗（发容器关闭包），便于连续用例；保留玩家视角与位置不变
+                    // 判定完自动关窗，便于连续用例；保留玩家视角与位置不变。
+                    // 必须发包关容器（player.closeContainer），否则服务端菜单不 removed、
+                    // merchant.tradingPlayer 不清空，后续右键会被「已在交易」门控挡住。
                     if (pi.autoClose() && merchantOpen) {
-                        mc.setScreen(null);
+                        p.closeContainer();
                     }
                     f.complete(m);
                 } else {
@@ -350,6 +352,17 @@ public final class ClientPlayerController {
         registerClient(d, "world.entities", "列出周围指定半径内的生物",
                 List.of(RpcParamSpec.optional("radius", "float", 32, "搜索半径（格）")),
                 3000, p -> listEntities(f(p, "radius", 32)));
+
+        // ── 交易 GUI（须先用 player.interact 打开怪物交易界面，autoClose=false）──
+        registerClient(d, "trade.status", "读取当前交易菜单：每条报价 uses/限购/售罄、货币槽、结果槽",
+                List.of(), 3000, p -> tradeStatus());
+        registerClient(d, "trade.select", "选中第 index 条报价（等价点报价按钮，绿宝石挪入货币槽）",
+                List.of(RpcParamSpec.required("index", "integer", "报价下标，从 0 开始")),
+                5000, p -> tradeSelect((int) f(p, "index", 0)));
+        registerClient(d, "trade.take", "Shift-点击结果槽成交一次（扣款、出货、uses+1、售罄同步）",
+                List.of(), 5000, p -> tradeTake());
+        registerClient(d, "trade.close", "关闭当前交易界面（等价按 Esc，发容器关闭包）",
+                List.of(), 3000, p -> tradeClose());
     }
 
     /**
@@ -667,6 +680,129 @@ public final class ClientPlayerController {
         }
         p.connection.sendChat(msg);
         return "已发送聊天: " + msg;
+    }
+
+    // ── 村民式交易 GUI 驱动（T-TRADE-005 真机成交）──────────────────
+    //
+    // 客户端 MerchantScreen 点报价按钮 = menu.tryMoveItems(i)（本地把绿宝石挪进
+    // 货币槽做预测）+ 发 ServerboundSelectTradePacket（服务端 MerchantMenu 权威地
+    // 再挪一次）；点结果槽成交用标准 handleInventoryMouseClick(QUICK_MOVE, slot=2)，
+    // 服务端 MerchantResultSlot.onTake 扣款出货并回调 Merchant#notifyTrade。
+    // 这里只做一帧式原语，多帧时序（等结果槽填充/等售罄同步包）由 Python 脚本编排。
+
+    /** 取当前打开的交易菜单，未打开交易 GUI 时抛错。 */
+    private net.minecraft.world.inventory.MerchantMenu requireMerchantMenu() {
+        LocalPlayer p = requirePlayer();
+        if (!(p.containerMenu instanceof net.minecraft.world.inventory.MerchantMenu mm)) {
+            throw new RpcException(RpcErrorCodes.NOT_READY,
+                    "当前未打开交易界面（containerMenu="
+                            + (p.containerMenu == null ? "null"
+                            : p.containerMenu.getClass().getSimpleName()) + "）");
+        }
+        return mm;
+    }
+
+    /** 选中第 i 条报价：等价点 MerchantScreen 报价按钮（postButtonClick）。 */
+    private Object tradeSelect(int index) {
+        LocalPlayer p = requirePlayer();
+        var mm = requireMerchantMenu();
+        var offers = mm.getOffers();
+        if (offers == null || index < 0 || index >= offers.size()) {
+            throw new RpcException(RpcErrorCodes.INVALID_PARAMS,
+                    "报价下标越界: " + index + "（共 " + (offers == null ? 0 : offers.size()) + " 条）");
+        }
+        mm.setSelectionHint(index);
+        mm.tryMoveItems(index);   // 客户端预测：把绿宝石挪入货币槽
+        p.connection.send(new net.minecraft.network.protocol.game.ServerboundSelectTradePacket(index));
+        return tradeStatus(mm);
+    }
+
+    /**
+     * Shift-点击结果槽（slot=2）取货成交：走原版容器点击管线，服务端 onTake 扣款、
+     * 回调 Merchant#notifyTrade（uses+1）并由服务端重发报价（售罄红叉）。
+     */
+    private Object tradeTake() {
+        LocalPlayer p = requirePlayer();
+        var mm = requireMerchantMenu();
+        mc.gameMode.handleInventoryMouseClick(
+                mm.containerId, 2, 0,
+                net.minecraft.world.inventory.ClickType.QUICK_MOVE, p);
+        return tradeStatus(mm);
+    }
+
+    /** 读交易菜单当前状态：报价 uses/限购/售罄、货币槽与结果槽、产物背包总数。 */
+    private Object tradeStatus() {
+        return tradeStatus(requireMerchantMenu());
+    }
+
+    private java.util.Map<String, Object> tradeStatus(
+            net.minecraft.world.inventory.MerchantMenu mm) {
+        java.util.Map<String, Object> m = new LinkedHashMap<>();
+        var offers = mm.getOffers();
+        java.util.List<Object> list = new java.util.ArrayList<>();
+        if (offers != null) {
+            for (int i = 0; i < offers.size(); i++) {
+                net.minecraft.world.item.trading.MerchantOffer o =
+                        (net.minecraft.world.item.trading.MerchantOffer) offers.get(i);
+                java.util.Map<String, Object> om = new LinkedHashMap<>();
+                om.put("index", i);
+                om.put("uses", o.getUses());
+                om.put("maxUses", o.getMaxUses());
+                om.put("outOfStock", o.isOutOfStock());
+                // 真实成交价（getCostA 含 demand/乘数修正；本 mod multiplier=0 即配置价）。
+                // 注意：货币槽可能被客户端 tryMoveItems 填入一整组(64)，那不代表成交价。
+                om.put("costA", itemName(o.getCostA()));
+                om.put("costACount", o.getCostA().getCount());
+                om.put("costBCount", o.getCostB().getCount());
+                om.put("result", itemName(o.getResult()));
+                om.put("resultCount", o.getResult().getCount());
+                list.add(om);
+            }
+        }
+        m.put("offerCount", list.size());
+        m.put("offers", list);
+        // tradeContainer：0=costA,1=costB,2=result（MerchantMenu 注册顺序）
+        m.put("costA", describeMenuSlot(mm, 0));
+        m.put("costB", describeMenuSlot(mm, 1));
+        m.put("result", describeMenuSlot(mm, 2));
+        // 背包+快捷栏（MerchantMenu 槽位 3..38）物品聚合 itemId->数量，供成交后核对扣款/入包。
+        java.util.Map<String, Integer> inv = new java.util.LinkedHashMap<>();
+        for (int s = 3; s <= 38; s++) {
+            net.minecraft.world.item.ItemStack st = mm.getSlot(s).getItem();
+            if (!st.isEmpty()) {
+                inv.merge(itemName(st), st.getCount(), Integer::sum);
+            }
+        }
+        m.put("inventory", inv);
+        return m;
+    }
+
+    private String itemName(net.minecraft.world.item.ItemStack st) {
+        return st.isEmpty() ? "" : st.getItem().builtInRegistryHolder().key().location().toString();
+    }
+
+    private java.util.Map<String, Object> describeMenuSlot(
+            net.minecraft.world.inventory.MerchantMenu mm, int slot) {
+        net.minecraft.world.item.ItemStack st = mm.getSlot(slot).getItem();
+        java.util.Map<String, Object> sm = new LinkedHashMap<>();
+        sm.put("item", itemName(st));
+        sm.put("count", st.getCount());
+        return sm;
+    }
+
+    /**
+     * 关闭交易界面。必须走 {@code player.closeContainer()}：它发
+     * ServerboundContainerClosePacket（服务端 MerchantMenu.removed 才会 setTradingPlayer(null)）
+     * 再本地 setScreen(null)。裸 mc.setScreen(null) 只触发屏幕 removed()、不发包，
+     * 会让服务端一直以为玩家在交易，导致之后右键重开被「已在交易」门控挡下。
+     */
+    private String tradeClose() {
+        LocalPlayer p = requirePlayer();
+        if (!(p.containerMenu instanceof net.minecraft.world.inventory.MerchantMenu)) {
+            return "当前无交易界面，无需关闭";
+        }
+        p.closeContainer();
+        return "已关闭交易界面";
     }
 
     /**
