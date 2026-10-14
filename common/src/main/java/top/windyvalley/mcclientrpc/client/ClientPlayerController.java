@@ -357,6 +357,18 @@ public final class ClientPlayerController {
                         RpcParamSpec.required("y", "integer", "床方块 y"),
                         RpcParamSpec.required("z", "integer", "床方块 z")),
                 8000, p -> useBed((int) f(p, "x", 0), (int) f(p, "y", 0), (int) f(p, "z", 0)));
+        registerClient(d, "player.placeBlock",
+                "对指定方块的指定面使用主手物品（真实 gameMode.useItemOn 发包，与真人放方块同路径，"
+                        + "会触发服务端 setPlacedBy/图案检测）。新方块放在 face 相邻格。",
+                List.of(RpcParamSpec.required("x", "integer", "被点击方块 x"),
+                        RpcParamSpec.required("y", "integer", "被点击方块 y"),
+                        RpcParamSpec.required("z", "integer", "被点击方块 z"),
+                        RpcParamSpec.optional("face", "string", "up",
+                                "点击面：up/down/north/south/east/west"),
+                        RpcParamSpec.optional("sneak", "boolean", false,
+                                "是否潜行放置（对着有交互的方块放东西时需要）")),
+                8000, p -> placeBlock((int) f(p, "x", 0), (int) f(p, "y", 0), (int) f(p, "z", 0),
+                        str(p, "face", "up"), bool(p, "sneak", false)));
 
         // ── 交易 GUI（须先用 player.interact 打开怪物交易界面，autoClose=false）──
         registerClient(d, "trade.status", "读取当前交易菜单：每条报价 uses/限购/售罄、货币槽、结果槽",
@@ -990,6 +1002,74 @@ public final class ClientPlayerController {
         m.put("clientResult", result == null ? "null" : result.toString());
         m.put("isSleeping", p.isSleeping());
         return m;
+    }
+
+    /**
+     * 对指定方块的指定面使用主手物品（真实 {@code gameMode.useItemOn}，发
+     * ServerboundUseItemOnPacket），与真人放方块同路径——服务端会走 BlockItem#place →
+     * setPlacedBy，因此能触发依赖「玩家真实放置」的检测（如凋灵图案 WitherSkullBlock）。
+     *
+     * <p>物品由调用方通过 RCON 放进玩家主手（/item replace ... with）。新方块落在
+     * 被点击方块 {@code face} 相邻格。reach 与服务端 raycast 都按真实视线判定，
+     * 故这里强制把视角对准该面中心。
+     */
+    private java.util.Map<String, Object> placeBlock(int x, int y, int z, String faceName, boolean sneak) {
+        LocalPlayer p = requirePlayer();
+        if (mc.gameMode == null) {
+            throw new RpcException(RpcErrorCodes.NOT_READY, "gameMode 未就绪（不在多人游戏？）");
+        }
+        net.minecraft.core.Direction face;
+        try {
+            face = net.minecraft.core.Direction.valueOf(faceName.toUpperCase(java.util.Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            throw new RpcException(RpcErrorCodes.INVALID_PARAMS,
+                    "face 必须是 up/down/north/south/east/west，收到: " + faceName);
+        }
+        net.minecraft.core.BlockPos clicked = new net.minecraft.core.BlockPos(x, y, z);
+        // 命中点 = 被点击方块该面的中心
+        net.minecraft.world.phys.Vec3 hitVec = new net.minecraft.world.phys.Vec3(
+                x + 0.5 + face.getStepX() * 0.5,
+                y + 0.5 + face.getStepY() * 0.5,
+                z + 0.5 + face.getStepZ() * 0.5);
+        double dist = Math.sqrt(p.distanceToSqr(hitVec));
+        double reach = p.blockInteractionRange();
+        if (dist > reach) {
+            throw new RpcException(RpcErrorCodes.OUT_OF_REACH, "目标方块超出触及距离，需先走近",
+                    java.util.Map.of("distance", round1(dist), "reach", round1(reach)));
+        }
+        // 强制视线对准命中点，保证服务端按玩家视角重做 raycast 时也命中该面
+        net.minecraft.world.phys.Vec3 eye = p.getEyePosition(1.0f);
+        double dx = hitVec.x - eye.x, dy = hitVec.y - eye.y, dz = hitVec.z - eye.z;
+        double horiz = Math.sqrt(dx * dx + dz * dz);
+        p.setXRot((float) (-Math.toDegrees(Math.atan2(dy, horiz))));
+        p.setYRot((float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0));
+
+        boolean wasSneaking = p.isShiftKeyDown();
+        if (sneak) {
+            p.setShiftKeyDown(true);
+        }
+        final net.minecraft.world.phys.Vec3 fv = hitVec;
+        try {
+            net.minecraft.world.phys.BlockHitResult hit = new net.minecraft.world.phys.BlockHitResult(
+                    fv, face, clicked, false);
+            net.minecraft.world.InteractionResult result =
+                    mc.gameMode.useItemOn(p, InteractionHand.MAIN_HAND, hit);
+            p.swing(InteractionHand.MAIN_HAND);
+            net.minecraft.core.BlockPos placed = clicked.relative(face);
+            java.util.Map<String, Object> m = new LinkedHashMap<>();
+            m.put("clicked", x + " " + y + " " + z);
+            m.put("face", face.getName());
+            m.put("placedPos", placed.getX() + " " + placed.getY() + " " + placed.getZ());
+            m.put("distance", round1(dist));
+            m.put("clientResult", result == null ? "null" : result.toString());
+            m.put("mainhand", p.getMainHandItem().isEmpty()
+                    ? "empty" : p.getMainHandItem().getItem().toString());
+            return m;
+        } finally {
+            if (sneak) {
+                p.setShiftKeyDown(wasSneaking);
+            }
+        }
     }
 
     private String move(float forward, float strafe, boolean jump) {
