@@ -60,7 +60,7 @@
 ### `methods.list`
 列出所有已注册方法及其参数 schema。
 - 参数：无
-- 返回：`{"count": 19, "methods": [{"name": ..., "description": ..., "params": [{"name","type","required",["default"],"description"}]}, ...]}`
+- 返回：`{"count": 22, "methods": [{"name": ..., "description": ..., "params": [{"name","type","required",["default"],"description"}]}, ...]}`
 
 ---
 
@@ -97,6 +97,48 @@
 完全退出客户端进程（等价标题屏「退出」）。
 - 立即返回：`客户端将在 500ms 后退出`；延迟 500ms（留出响应发送时间）在 render thread 调 `Minecraft.destroy()`，并以 `halt(0)` 兜底。
 - 本方法不走任务队列（destroy 会终止 JVM，阻塞等 future 永远等不到）。
+
+---
+
+## 单机存档（标题屏可用）
+
+三个方法都走官方 `WorldOpenFlows` 路径，与真人点按钮 / quickPlay 单机等价；调用前若在世界中，先 `client.disconnect`。
+
+### `world.list`
+列出本机存档（后台线程异步读 `level.dat` 摘要，不阻塞游戏循环）。
+- 参数：无
+- 返回：`{"count": N, "worlds": [{"id","name","lastPlayed","locked","experimental","disabled","playable",
+  "gameMode","hardcore","cheats","version"}, ...]}`
+  - `id`：存档**目录名**，`world.enter` 用它
+  - `playable=false` 表示损坏 / 符号链接存档，此时无 gameMode 等字段
+  - `worlds` 按最后游玩时间倒序（与游戏内列表一致）
+
+### `world.create`
+按参数创建世界并进入。走官方 `WorldOpenFlows.createFreshLevel`（标题屏「试玩演示世界」按钮同路径，内部 `managedBlock` 自泵，可安全同步加载）。发起后用 `client.status` 轮询 `inWorld=true`（通常方法返回时已在世界中）。
+- 参数：
+
+| 名称 | 类型 | 必传 | 默认 |
+|------|------|------|------|
+| `name` | string | 否 | `New World` |
+| `seed` | string | 否 | 空（随机；数字按 long 解析，其他文本按 `String.hashCode()`，与 GUI 一致） |
+| `gameMode` | string | 否 | `survival`（survival/creative/adventure/spectator） |
+| `hardcore` | boolean | 否 | `false`（为 true 时强制 survival + hard） |
+| `difficulty` | string | 否 | `normal`（peaceful/easy/normal/hard） |
+| `allowCheats` | boolean | 否 | 不传：创造=true 其余=false（与 GUI 默认一致） |
+| `generateStructures` | boolean | 否 | `true` |
+| `bonusChest` | boolean | 否 | `false` |
+| `preset` | string | 否 | `normal`（normal/flat） |
+
+- 返回：`已创建并进入世界 <名>（目录 <folder>，种子 <long>）…`
+- 重名目录自动加 `(1)/(2)` 后缀，不覆盖旧档（与 GUI 同规则）。
+- 错误：已在世界中 -32001；空 name / 非法 gameMode/difficulty/preset -32602。
+
+### `world.enter`
+进入已有单机存档。走官方 `openWorld`，与启动参数 `--quickPlaySingleplayer <id>` 完全同路径（含版本兼容检查）。
+- 参数：`id`（string，**必传**，`world.list` 返回的目录名）
+- 返回：`已发起进入存档 <id>（异步加载，用 client.status 轮询 inWorld…）`
+- 全新同版本存档无确认框直接进；**旧版本 / 实验性存档会停在 `BackupConfirmScreen`**（screen 非 null），当前不自动点确认，需真人或后续原语处理。
+- 错误：已在世界中 -32001；id 不存在 -32002（data 含 id）。
 
 ---
 
