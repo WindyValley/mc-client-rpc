@@ -20,10 +20,12 @@
 成功打印 ALL PASS 并退出 0；任一断言失败抛错退出非 0。
 用法：python scripts/verify_world_lifecycle.py [--keep-client]
 """
+import gzip
 import json
 import os
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -36,6 +38,115 @@ if not SAVES.exists():
     SAVES = ROOT / "run" / "saves"
 WORLD_PREFIX = "mcrpc-wl-"
 BOOT_TIMEOUT, SETTLE_SECONDS, POLL = 240, 5, 1.0
+
+
+def _read_payload(buf, pos, tag_type):
+    """返回 (跳过该 payload 后的新 pos, children_or_None, raw_value_or_None)。
+
+    最小 NBT 读取：Compound 递归成 [(name,(type,node))]；Int 取值；
+    其他类型只算长度跳过，payload 原样保留在父级 raw 里（结构不变）。
+    """
+    if tag_type == 1:
+        return pos + 1, None, None
+    if tag_type == 2:
+        return pos + 2, None, None
+    if tag_type == 3:
+        return pos + 4, None, struct.unpack(">i", buf[pos:pos + 4])[0]
+    if tag_type == 4:
+        return pos + 8, None, None
+    if tag_type == 5:
+        return pos + 4, None, None
+    if tag_type == 6:
+        return pos + 8, None, None
+    if tag_type == 7:
+        n = struct.unpack(">i", buf[pos:pos + 4])[0]
+        return pos + 4 + n, None, None
+    if tag_type == 8:
+        n = struct.unpack(">H", buf[pos:pos + 2])[0]
+        return pos + 2 + n, None, None
+    if tag_type == 9:
+        child_type = buf[pos]
+        n = struct.unpack(">i", buf[pos + 1:pos + 5])[0]
+        pos = pos + 5
+        for _ in range(n):
+            pos, _, _ = _read_payload(buf, pos, child_type)
+        return pos, None, None
+    if tag_type == 10:
+        children = []
+        while True:
+            t = buf[pos]
+            pos += 1
+            if t == 0:
+                break
+            nl = struct.unpack(">H", buf[pos:pos + 2])[0]
+            name = buf[pos + 2:pos + 2 + nl].decode("utf-8", "replace")
+            pos = pos + 2 + nl
+            pos, kids, val = _read_payload(buf, pos, t)
+            children.append((name, t, kids, val))
+        return pos, children, None
+    if tag_type == 11:
+        n = struct.unpack(">i", buf[pos:pos + 4])[0]
+        return pos + 4 + n * 4, None, None
+    if tag_type == 12:
+        n = struct.unpack(">i", buf[pos:pos + 4])[0]
+        return pos + 4 + n * 8, None, None
+    raise ValueError(f"不支持的 NBT tag 类型 {tag_type} @ {pos}")
+
+
+def _find(children, name):
+    for c in children:
+        if c[0] == name:
+            return c
+    return None
+
+
+def bump_leveldat_version_id(level_dat: Path, new_id: int):
+    """把 level.dat 内 Data.Version.Id 改成 new_id（结构保留，其余字节不动）。
+
+    用途：造「降级加载」场景——游戏按 Data.Version.Id 判定数据版本更高而弹
+    BackupConfirmScreen，但真正 DFU 读的是根 DataVersion（不动），世界仍可加载。
+    """
+    raw = gzip.decompress(level_dat.read_bytes())
+    assert raw[0] == 10
+    nl = struct.unpack(">H", raw[1:3])[0]
+    root_start = 3 + nl
+    end, root, _ = _read_payload(raw, root_start, 10)
+    assert end == len(raw), f"NBT 长度不一致 {end} != {len(raw)}"
+
+    def old_id():
+        data = _find(root, "Data")
+        ver = _find(data[2], "Version")
+        node = _find(ver[2], "Id")
+        assert node is not None and node[1] == 3
+        return node[3]
+
+    def find_int_offset(buf, start, target_path, path=()):
+        """在 compound(start) 内找 target_path 指向的 Int payload 偏移。"""
+        p = start
+        while True:
+            t = buf[p]
+            p += 1
+            if t == 0:
+                return None
+            nml = struct.unpack(">H", buf[p:p + 2])[0]
+            nm = buf[p + 2:p + 2 + nml].decode("utf-8", "replace")
+            p0 = p + 2 + nml
+            cur = path + (nm,)
+            if cur == target_path and t == 3:
+                return p0
+            if t == 10:
+                hit = find_int_offset(buf, p0, target_path, cur)
+                if hit is not None:
+                    return hit
+            p, _, _ = _read_payload(buf, p0, t)
+
+    off = find_int_offset(raw, root_start, ("Data", "Version", "Id"))
+    assert off is not None, "找不到 Data/Version/Id"
+    before = struct.unpack(">i", raw[off:off + 4])[0]
+    assert before == old_id(), f"偏移定位错误 {before} != {old_id()}"
+    patched = raw[:off] + struct.pack(">i", new_id) + raw[off + 4:]
+    level_dat.write_bytes(gzip.compress(patched))
+    print(f"[夹具] {level_dat.name}: Data.Version.Id {before} -> {new_id}")
 
 _failures = []
 
@@ -231,7 +342,53 @@ def main():
     rpc("client.disconnect", timeout=15)
     settle_title()
 
-    # 9. 重名自动 (1)，不覆盖旧档
+    # 9. 降级存档：改 Data.Version.Id 造高版本，enter 应自动备份后进入
+    backups_dir = SAVES.parent / "backups"
+    backups_before = {p.name for p in backups_dir.glob("*mcrpc-wl-*.zip")} \
+        if backups_dir.exists() else set()
+
+    dg_name = WORLD_PREFIX + "downgrade"
+    rpc("world.create", {"name": dg_name, "preset": "flat", "gameMode": "creative"})
+    wait_in_world()
+    rpc("client.disconnect", timeout=15)
+    settle_title()  # 必须等内置服完全退出、释放 level.dat 文件锁
+
+    dg_dat = SAVES / dg_name / "level.dat"
+    bump_leveldat_version_id(dg_dat, 9999)  # 3955 → 9999 造降级警告
+    # 阻塞式：返回时应已自动点「备份并加入」并进世界
+    r = rpc("world.enter", {"id": dg_name}, timeout=130)
+    print(f"[downgrade-backup] {r}")
+    st = rpc("client.status", timeout=5)
+    check(st.get("inWorld") and st.get("screen") is None,
+          "降级档自动备份后已进入世界", json.dumps(st, ensure_ascii=False))
+    # backups/ 下应出现含该 levelId 的新 zip
+    zips_after = {p.name: p.stat().st_size for p in backups_dir.glob("*mcrpc-wl-*.zip")}
+    new_zip = [n for n in zips_after if n not in backups_before and dg_name in n]
+    check(len(new_zip) == 1 and zips_after[new_zip[0]] > 1000,
+          "backups/ 生成该存档的备份 zip", str(new_zip))
+    rpc("client.disconnect", timeout=15)
+    settle_title()
+
+    # 9b. backup=false：同样的降级档，跳过备份，不产生新 zip，仍进入
+    dg2_name = WORLD_PREFIX + "downgrade-nobak"
+    rpc("world.create", {"name": dg2_name, "preset": "flat", "gameMode": "creative"})
+    wait_in_world()
+    rpc("client.disconnect", timeout=15)
+    settle_title()
+    bump_leveldat_version_id(SAVES / dg2_name / "level.dat", 9999)
+    zips_before2 = {p.name for p in backups_dir.glob("*mcrpc-wl-*.zip")}
+    r = rpc("world.enter", {"id": dg2_name, "backup": False}, timeout=130)
+    print(f"[downgrade-nobackup] {r}")
+    st = rpc("client.status", timeout=5)
+    check(st.get("inWorld") and st.get("screen") is None,
+          "backup=false 跳过备份后也进入世界", json.dumps(st, ensure_ascii=False))
+    zips_after2 = {p.name for p in backups_dir.glob("*mcrpc-wl-*.zip")}
+    check(not (zips_after2 - zips_before2),
+          "backup=false 未产生新备份 zip", str(zips_after2 - zips_before2))
+    rpc("client.disconnect", timeout=15)
+    settle_title()
+
+    # 10. 重名自动 (1)，不覆盖旧档
     r = rpc("world.create", {"name": flat_name, "preset": "flat",
                              "gameMode": "creative"})
     print(f"[create-dup] {r}")
@@ -255,7 +412,14 @@ def main():
         for p in SAVES.glob(WORLD_PREFIX + "*"):
             shutil.rmtree(p, ignore_errors=True)
             removed.append(p.name)
-        print(f"[收尾] 清理测试存档 {removed}（saves={SAVES}）")
+        bak_removed = []
+        bdir = SAVES.parent / "backups"
+        if bdir.exists():
+            for z in bdir.glob("*mcrpc-wl-*.zip"):
+                z.unlink()
+                bak_removed.append(z.name)
+        print(f"[收尾] 清理测试存档 {removed}")
+        print(f"[收尾] 清理测试备份 {bak_removed}（saves={SAVES}）")
 
     print("-" * 60)
     if _failures:
