@@ -1,6 +1,7 @@
 package top.windyvalley.mcclientrpc.client;
 
 import com.google.gson.JsonObject;
+import net.minecraft.FileUtil;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.ConnectScreen;
@@ -8,8 +9,21 @@ import net.minecraft.client.gui.screens.TitleScreen;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.resolver.ServerAddress;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.world.Difficulty;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.GameRules;
+import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.LevelSettings;
+import net.minecraft.world.level.WorldDataConfiguration;
+import net.minecraft.world.level.levelgen.WorldDimensions;
+import net.minecraft.world.level.levelgen.WorldOptions;
+import net.minecraft.world.level.levelgen.presets.WorldPresets;
+import net.minecraft.world.level.storage.LevelStorageException;
+import net.minecraft.world.level.storage.LevelStorageSource;
+import net.minecraft.world.level.storage.LevelSummary;
 import top.windyvalley.mcclientrpc.McClientRpc;
 import top.windyvalley.mcclientrpc.protocol.MethodDefinition;
 import top.windyvalley.mcclientrpc.protocol.RpcDispatcher;
@@ -17,8 +31,10 @@ import top.windyvalley.mcclientrpc.protocol.RpcErrorCodes;
 import top.windyvalley.mcclientrpc.protocol.RpcException;
 import top.windyvalley.mcclientrpc.protocol.RpcParamSpec;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
@@ -305,6 +321,40 @@ public final class ClientPlayerController {
         d.register(MethodDefinition.of("client.quit", "完全退出客户端进程",
                 List.of(), p -> quitGame()));
 
+        // ── 单机存档（创建/进入/列举，走官方 WorldOpenFlows 路径）──
+        registerClientDeferred(d, "world.list", "列出本机存档（id/名称/模式/最后游玩），异步读取",
+                List.of(), 30000, p -> this::listWorlds);
+        registerClient(d, "world.create",
+                "按参数创建世界并进入（默认世界/种子可文本/模式/难度/作弊/结构/奖励箱/normal|flat，"
+                        + "走官方 createFreshLevel；发起后轮询 client.status.inWorld）",
+                List.of(RpcParamSpec.optional("name", "string", "New World", "世界显示名（同时决定存档目录名）"),
+                        RpcParamSpec.optional("seed", "string", "", "种子（数字或任意文本；空=随机）"),
+                        RpcParamSpec.optional("gameMode", "string", "survival",
+                                "survival/creative/adventure/spectator（hardcore=true 时强制 survival）"),
+                        RpcParamSpec.optional("hardcore", "boolean", false, "极限模式（锁定困难+一条命）"),
+                        RpcParamSpec.optional("difficulty", "string", "normal",
+                                "peaceful/easy/normal/hard（hardcore=true 时强制 hard）"),
+                        RpcParamSpec.optional("allowCheats", "boolean", null,
+                                "是否允许作弊/指令；不传则创造=true 其余=false"),
+                        RpcParamSpec.optional("generateStructures", "boolean", true, "生成建筑（村庄等）"),
+                        RpcParamSpec.optional("bonusChest", "boolean", false, "出生点奖励箱"),
+                        RpcParamSpec.optional("preset", "string", "normal", "世界类型：normal/flat")),
+                120000, p -> createWorld(
+                        str(p, "name", "New World"),
+                        str(p, "seed", ""),
+                        str(p, "gameMode", "survival"),
+                        bool(p, "hardcore", false),
+                        str(p, "difficulty", "normal"),
+                        p.has("allowCheats") && !p.get("allowCheats").isJsonNull()
+                                ? p.get("allowCheats").getAsBoolean() : null,
+                        bool(p, "generateStructures", true),
+                        bool(p, "bonusChest", false),
+                        str(p, "preset", "normal")));
+        registerClient(d, "world.enter", "进入已有单机存档（走官方 openWorld，等价 quickPlay 单机；发起后轮询 inWorld）",
+                List.of(RpcParamSpec.required("id", "string", "存档目录名（world.list 返回的 id）")),
+                120000, p -> enterWorld(required(p, "id")));
+
+
         // ── 进入世界后（玩家操控）──
         registerClient(d, "player.pos", "查询玩家坐标、维度与血量",
                 List.of(), 3000, p -> playerPos());
@@ -563,6 +613,161 @@ public final class ClientPlayerController {
         // parent 用 TitleScreen：连接界面叠加其上，断开时自然回到主菜单。
         ConnectScreen.startConnecting(new TitleScreen(), mc, serverAddress, serverData, false, null);
         return "已发起连接 " + address + "（异步，用 client.status 轮询进世界）";
+    }
+
+    // ── 单机存档：列举 / 创建 / 进入（全部走官方 WorldOpenFlows 路径）──────
+
+    /**
+     * 列出本机存档。{@code loadLevelSummaries} 在后台线程读 level.dat，
+     * 不能在 render thread 上 join（会死锁游戏循环）；故本动作只发起读取，
+     * 完成后由 future 链切回 render thread 完成 RPC future（参照 SelectWorldScreen）。
+     */
+    private void listWorlds(CompletableFuture<Object> rpc) {
+        if (mc.getLevelSource() == null) {
+            rpc.completeExceptionally(new RpcException(RpcErrorCodes.NOT_READY, "存档源尚未就绪"));
+            return;
+        }
+        final LevelStorageSource.LevelCandidates candidates;
+        try {
+            candidates = mc.getLevelSource().findLevelCandidates();
+        } catch (LevelStorageException e) {
+            rpc.completeExceptionally(new RpcException(RpcErrorCodes.INTERNAL_ERROR,
+                    "读取存档列表失败: " + e.getMessage()));
+            return;
+        }
+        mc.getLevelSource().loadLevelSummaries(candidates).whenComplete((summaries, err) -> {
+            if (err != null) {
+                rpc.completeExceptionally(new RpcException(RpcErrorCodes.INTERNAL_ERROR,
+                        "读取存档摘要失败: " + (err.getCause() != null ? err.getCause().getMessage() : err.getMessage())));
+                return;
+            }
+            // 切回 render thread 组装结果（虽只读本对象，保持线程纪律）
+            mc.execute(() -> {
+                List<Object> worlds = new ArrayList<>();
+                for (LevelSummary s : summaries) {
+                    LinkedHashMap<String, Object> w = new LinkedHashMap<>();
+                    w.put("id", s.getLevelId());
+                    w.put("name", s.getLevelName());
+                    w.put("lastPlayed", s.getLastPlayed());
+                    w.put("locked", s.isLocked());
+                    w.put("experimental", s.isExperimental());
+                    w.put("disabled", s.isDisabled());
+                    // CorruptedLevelSummary / SymlinkLevelSummary 没有有效 settings
+                    boolean normal = s.getClass() == LevelSummary.class;
+                    w.put("playable", normal);
+                    if (normal) {
+                        w.put("gameMode", s.getGameMode().getName());
+                        w.put("hardcore", s.isHardcore());
+                        w.put("cheats", s.hasCommands());
+                        w.put("version", s.getWorldVersionName().getString());
+                    }
+                    worlds.add(w);
+                }
+                LinkedHashMap<String, Object> result = new LinkedHashMap<>();
+                result.put("count", worlds.size());
+                result.put("worlds", worlds);
+                rpc.complete(result);
+            });
+        });
+    }
+
+    /**
+     * 创建并进入世界 —— 走官方 {@code WorldOpenFlows.createFreshLevel}（标题屏
+     * Demo 世界按钮同一路径）。该方法内部用 {@code managedBlock} 在加载期间
+     * 继续泵 render 任务，因此在 render thread 同步调用是安全的；加载完成后
+     * doWorldLoad 切到游戏内界面，方法返回时通常已在世界中。
+     */
+    private String createWorld(String rawName, String seedText, String gameModeText,
+                               boolean hardcore, String difficultyText,
+                               Boolean allowCheats, boolean structures,
+                               boolean bonusChest, String presetText) {
+        if (mc.player != null) {
+            throw new RpcException(RpcErrorCodes.NOT_READY,
+                    "已在世界中，先 client.disconnect 再创建");
+        }
+        String name = rawName == null ? "" : rawName.trim();
+        if (name.isEmpty()) {
+            throw new RpcException(RpcErrorCodes.INVALID_PARAMS, "世界名 name 不能为空");
+        }
+
+        // 目录名与 CreateWorldScreen.findResultFolder 同源：重名自动加 (1)/(2)
+        String folder;
+        try {
+            folder = FileUtil.findAvailableName(mc.getLevelSource().getBaseDir(), name, "");
+        } catch (Exception e) {
+            throw new RpcException(RpcErrorCodes.INTERNAL_ERROR,
+                    "无法分配存档目录: " + e.getMessage());
+        }
+        if (mc.getLevelSource().levelExists(folder)) {
+            throw new RpcException(RpcErrorCodes.INVALID_PARAMS,
+                    "存档目录已存在: " + folder);
+        }
+
+        GameType gameType = GameType.byName(gameModeText.trim().toLowerCase(), null);
+        if (gameType == null) {
+            throw new RpcException(RpcErrorCodes.INVALID_PARAMS,
+                    "未知 gameMode: " + gameModeText + "（survival/creative/adventure/spectator）");
+        }
+        Difficulty difficulty = Difficulty.byName(difficultyText.trim().toLowerCase());
+        if (difficulty == null) {
+            throw new RpcException(RpcErrorCodes.INVALID_PARAMS,
+                    "未知 difficulty: " + difficultyText + "（peaceful/easy/normal/hard）");
+        }
+        // 原版规则：极限模式锁生存 + 困难
+        if (hardcore) {
+            gameType = GameType.SURVIVAL;
+            difficulty = Difficulty.HARD;
+        }
+        boolean cheats = allowCheats != null ? allowCheats
+                : (gameType == GameType.CREATIVE); // 与 WorldCreationUiState 默认一致
+
+        LevelSettings settings = new LevelSettings(
+                name, gameType, hardcore, difficulty, cheats,
+                new GameRules(), WorldDataConfiguration.DEFAULT);
+
+        OptionalLong seedOpt = WorldOptions.parseSeed(seedText == null ? "" : seedText);
+        long seed = seedOpt.orElse(WorldOptions.randomSeed());
+        WorldOptions options = new WorldOptions(seed, structures, bonusChest);
+
+        java.util.function.Function<RegistryAccess, WorldDimensions> dimensionsFn;
+        String preset = presetText.trim().toLowerCase();
+        switch (preset) {
+            case "normal" -> dimensionsFn = WorldPresets::createNormalWorldDimensions;
+            case "flat" -> dimensionsFn = ra -> ra.registryOrThrow(Registries.WORLD_PRESET)
+                    .getHolderOrThrow(WorldPresets.FLAT).value().createWorldDimensions();
+            default -> throw new RpcException(RpcErrorCodes.INVALID_PARAMS,
+                    "未知 preset: " + presetText + "（normal/flat）");
+        }
+
+        McClientRpc.LOGGER.info("[RPC] 创建单机世界 folder={} name={} seed={} mode={} diff={} hardcore={} cheats={} preset={}",
+                folder, name, seed, gameType, difficulty, hardcore, cheats, preset);
+        // parent 给 TitleScreen：加载失败时官方路径会 setScreen 回它
+        mc.createWorldOpenFlows().createFreshLevel(
+                folder, settings, options, dimensionsFn, new TitleScreen());
+        return "已创建并进入世界 " + name + "（目录 " + folder + "，种子 " + seed
+                + "）；用 client.status 轮询 inWorld=true";
+    }
+
+    /**
+     * 进入已有单机存档 —— 走官方 {@code WorldOpenFlows.openWorld}，与
+     * quickPlay {@code --quickPlaySingleplayer <id>} 完全同路径（含版本兼容/备份确认）。
+     * 全新同版本存档不会弹任何确认框；旧版本存档可能停在备份确认 Screen，
+     * 此时 client.status.screen 非 null，需要真人或后续原语处理，这里不自动点确认。
+     */
+    private String enterWorld(String id) {
+        if (mc.player != null) {
+            throw new RpcException(RpcErrorCodes.NOT_READY,
+                    "已在世界中，先 client.disconnect 再进入");
+        }
+        String levelId = id.trim();
+        if (!mc.getLevelSource().levelExists(levelId)) {
+            throw new RpcException(RpcErrorCodes.TARGET_NOT_FOUND,
+                    "存档不存在: " + levelId, java.util.Map.of("id", levelId));
+        }
+        mc.setScreen(new TitleScreen());
+        mc.createWorldOpenFlows().openWorld(levelId, () -> mc.setScreen(new TitleScreen()));
+        return "已发起进入存档 " + levelId + "（异步加载，用 client.status 轮询 inWorld；"
+                + "若停在 BackupConfirmScreen 表示旧版本需人工确认）";
     }
 
     /**
