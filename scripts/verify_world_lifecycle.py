@@ -33,9 +33,25 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RPC_HOST, RPC_PORT = "127.0.0.1", 25586
-SAVES = ROOT / "neoforge" / "run" / "saves"
-if not SAVES.exists():
-    SAVES = ROOT / "run" / "saves"
+
+
+def _parse_loader():
+    """--loader fabric|neoforge（默认 neoforge），决定 runClient task 与 run 目录。"""
+    loader = "neoforge"
+    for i, a in enumerate(sys.argv):
+        if a == "--loader" and i + 1 < len(sys.argv):
+            loader = sys.argv[i + 1].lower()
+        elif a.startswith("--loader="):
+            loader = a.split("=", 1)[1].lower()
+    if loader not in ("neoforge", "fabric"):
+        raise SystemExit(f"不支持的 loader: {loader}（neoforge|fabric）")
+    return loader
+
+
+LOADER = _parse_loader()
+GRADLE_TASK = f":{LOADER}:runClient"
+RUN_DIR = ROOT / LOADER / "run"
+SAVES = RUN_DIR / "saves"
 WORLD_PREFIX = "mcrpc-wl-"
 BOOT_TIMEOUT, SETTLE_SECONDS, POLL = 240, 5, 1.0
 
@@ -209,13 +225,13 @@ def launch():
     if port_open():
         print("[启动] 25586 已在监听，复用现有客户端")
         return
-    log = open(ROOT / "runClient_world_verify.log", "ab")
+    log = open(ROOT / f"runClient_world_verify_{LOADER}.log", "ab")
     flags = 0x00000008 | 0x00000200
     subprocess.Popen(
-        ["cmd", "/c", "gradlew.bat", ":neoforge:runClient"],
+        ["cmd", "/c", "gradlew.bat", GRADLE_TASK],
         cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
         creationflags=flags, close_fds=True)
-    print("[启动] 已发起 :neoforge:runClient")
+    print(f"[启动] 已发起 {GRADLE_TASK}")
     t0 = time.time()
     while time.time() - t0 < BOOT_TIMEOUT:
         if port_open():
@@ -231,21 +247,24 @@ def launch():
 
 
 def settle_title():
-    for _ in range(5):
-        try:
-            rpc("client.toTitle", timeout=5)
-            break
-        except Exception:
-            time.sleep(2)
-    stable, t0 = 0.0, time.time()
-    while time.time() - t0 < 60:
+    # 初始引导屏(AccessibilityOnboardingScreen)在资源加载完成后才弹出，
+    # 可能盖掉我们过早切出的 TitleScreen——观察期内发现被盖回就重切。
+    stable, t0, last_force = 0.0, time.time(), 0.0
+    while time.time() - t0 < 90:
         st = rpc("client.status", timeout=5)
-        if st.get("screen") == "TitleScreen" and not st.get("inWorld"):
+        screen = st.get("screen")
+        if screen == "TitleScreen" and not st.get("inWorld"):
             stable += POLL
             if stable >= SETTLE_SECONDS:
                 return
         else:
             stable = 0.0
+            if time.time() - last_force > 3:
+                try:
+                    rpc("client.toTitle", timeout=5)
+                except Exception:
+                    pass
+                last_force = time.time()
         time.sleep(POLL)
     raise RuntimeError("标题屏未稳定")
 
