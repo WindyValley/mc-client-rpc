@@ -11,6 +11,7 @@ import net.minecraft.client.multiplayer.resolver.ServerAddress;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.Registries;
+import net.minecraft.network.chat.Component;
 import net.minecraft.world.Difficulty;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
@@ -838,26 +839,38 @@ public final class ClientPlayerController {
         }
 
         if (screen instanceof net.minecraft.client.gui.screens.BackupConfirmScreen bcs) {
+            // 按翻译键识别按钮，而不是 children 索引：
+            //  - UI 模组可能往本屏插入按钮 → 索引漂移会点错动作；
+            //  - 语言 / 资源包只改译文不改 key（TranslatableContents.getKey 稳定）。
+            // 键与 vanilla BackupConfirmScreen.init 一一对应：
+            //  backupJoinConfirmButton = proceed(true)（备份后加入）
+            //  backupJoinSkipButton    = proceed(false)（跳过备份）
+            String wantKey = es.backup()
+                    ? "selectWorld.backupJoinConfirmButton"
+                    : "selectWorld.backupJoinSkipButton";
             net.minecraft.client.gui.components.Button target = null;
-            int btnIdx = 0;
             for (var child : bcs.children()) {
-                if (child instanceof net.minecraft.client.gui.components.Button b) {
-                    // addRenderableWidget 顺序：0=备份并加入, 1=跳过备份, 2=取消
-                    if ((es.backup() && btnIdx == 0) || (!es.backup() && btnIdx == 1)) {
-                        target = b;
-                        break;
-                    }
-                    btnIdx++;
+                if (!(child instanceof net.minecraft.client.gui.components.Button b)) {
+                    continue;
+                }
+                Component msg = b.getMessage();
+                if (msg.getContents()
+                        instanceof net.minecraft.network.chat.contents.TranslatableContents tc
+                        && wantKey.equals(tc.getKey())) {
+                    target = b;
+                    break;
                 }
             }
-            McClientRpc.LOGGER.info("[RPC] 存档 {} 停在备份确认屏，自动点「{}」",
-                    es.levelId(), es.backup() ? "备份并加入" : "跳过备份");
+            McClientRpc.LOGGER.info("[RPC] 存档 {} 停在备份确认屏，自动点「{}」(key={})",
+                    es.levelId(), es.backup() ? "备份并加入" : "跳过备份", wantKey);
             if (target != null) {
                 target.onPress(); // 备份分支内部同步压缩存档后继续官方加载链
             } else {
                 enterSession = null;
                 f.completeExceptionally(new RpcException(RpcErrorCodes.INTERNAL_ERROR,
-                        "BackupConfirmScreen 上找不到确认按钮"));
+                        "BackupConfirmScreen 上找不到翻译键 " + wantKey
+                                + " 对应的按钮（可能被 UI 模组替换了本屏控件），为避免点错未自动操作",
+                        java.util.Map.of("id", es.levelId(), "expectedKey", wantKey)));
             }
             return;
         }
