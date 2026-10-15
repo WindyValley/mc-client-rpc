@@ -65,51 +65,23 @@ mc-client-rpc 在 **Minecraft 客户端进程内**开一个 JSON-RPC 服务，�
 
 ## 支持的 RPC 方法
 
-> 约定：参数为可选时给出默认值；标「必传」的参数缺失会报错。成功返回结构化 `result`（对象/数值/字符串）；失败返回 `error`。完整参数 schema 用 `methods.list` 自描述获取。
+共 **29 个方法**，通过 newline 分隔的 JSON-RPC 2.0 调用，运行时可用 `methods.list` 自描述获取参数 schema。
 
-### 通用
+按能力分组（括号内为方法名）：
 
-| 方法 | 参数 | 说明 |
-|------|------|------|
-| `methods.list` | — | 列出所有已注册方法及其参数 schema（名称/类型/必传/默认值/说明）|
+- **客户端导航**：查状态 / 回主菜单 / 连服 / 断开 / 退出（`client.status`、`client.toTitle`、`client.connect`、`client.disconnect`、`client.quit`）
+- **单机存档**：列举 / 按参数创建并进入 / 进入已有存档，降级世界自动备份后加载（`world.list`、`world.create`、`world.enter`）
+- **玩家状态**：坐标血量 / 完整状态 / 重生（`player.pos`、`player.state`、`player.respawn`）
+- **玩家操控**：视角 / 真实按键移动 / 跳跃 / 停止 / 走向目标（`player.look`、`player.move`、`player.jump`、`player.stop`、`player.moveToward`）
+- **战斗与交互**：攻击 / 寻路攻击 / 右键实体开交易（`player.attack`、`player.attackNearest`、`player.interact`）
+- **命令聊天**：斜杠命令 / 普通聊天（`player.command`、`player.chat`）
+- **方块交互**：右键床睡觉 / 对指定面放方块（`player.useBed`、`player.placeBlock`）
+- **世界查询**：列周围生物（`world.entities`）
+- **村民交易 GUI**：读报价 / 选报价 / 成交 / 关窗（`trade.status`、`trade.select`、`trade.take`、`trade.close`）
+- **系统**：`methods.list` 自描述
 
-### 客户端导航（进世界前后均可用）
-
-| 方法 | 参数 | 说明 |
-|------|------|------|
-| `client.status` | — | 当前界面 / 是否已进世界 / 是否已连服务器 / 服务器地址——自动化的「眼睛」 |
-| `client.toTitle` | — | 切到主菜单，跳过无障碍引导屏（`AccessibilityOnboardingScreen`）等拦路界面 |
-| `client.connect` | `host`（**必传**）, `port`（默认 25565）| 直连服务器，异步发起；配合 `client.status` 轮询到「已进世界」。不提供默认地址 |
-| `client.disconnect` | — | 断开连接、回主菜单（测试间重置）|
-| `client.quit` | — | 完全退出客户端进程（等价标题屏「退出」）|
-
-### 玩家状态
-
-| 方法 | 参数 | 说明 |
-|------|------|------|
-| `player.state` | — | 血量 / 位置 / 准星指向 / 是否在地面 / 是否死亡 |
-| `player.pos` | — | 坐标 / 维度 / 血量 |
-| `player.respawn` | — | 在死亡屏重生（等价点「重生」按钮）；注意重生点是世界出生点 |
-
-### 玩家操控
-
-| 方法 | 参数 | 说明 |
-|------|------|------|
-| `player.look` | `yaw`（默认0）, `pitch`（默认0）| 设置视角 |
-| `player.move` | `forward`, `strafe`, `jump` | **驱动真实按键映射**，由原版 tick 自然移动并发包；持续生效，需 `player.stop` 释放 |
-| `player.jump` | `down`（默认 true）| 按住 / 松开跳跃键映射 |
-| `player.stop` | — | 释放全部方向 / 跳跃键，停止移动 |
-| `player.moveToward` | `target`（默认 zombie）| 自动走向最近的指定生物，进入触及范围后自动停（tick 驱动）|
-| `player.attack` | `target`（默认 zombie）| 对准并攻击最近的指定生物；带触及距离守卫（超距报错）|
-| `player.attackNearest` | `target`（默认 zombie）| 高级指令：tick 驱动自动寻路 → 进入触及范围 → 攻击（约 15s 超时）|
-| `player.command` | `cmd` | 以玩家身份执行一条斜杠命令 |
-| `player.chat` | `msg` | 以玩家身份发送一条聊天消息 |
-
-### 世界查询
-
-| 方法 | 参数 | 说明 |
-|------|------|------|
-| `world.entities` | `radius`（默认 32）| 列出周围生物（类型、坐标、距离）|
+完整参数表、结构化返回字段、错误码、每方法超时与客户端状态机见
+**[RPC API 参考](docs/rpc-api.md)**（单一契约，勿在 README 复制逐方法细节以免过时）。
 
 ---
 
@@ -138,31 +110,31 @@ mc-client-rpc 在 **Minecraft 客户端进程内**开一个 JSON-RPC 服务，�
 成功：
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"type":"minecraft:zombie","distance":2.0}}
+{"jsonrpc":"2.0","id":1,"result":{"target":"minecraft:zombie","distance":2.0,"reach":3.0,"hpBefore":20.0,"hpAfter":17.0,"hit":true}}
 ```
 
-错误：
+错误（结构化细节在 `error.data`）：
 
 ```json
-{"jsonrpc":"2.0","id":1,"error":{"code":-32003,"message":"minecraft:zombie 距离 4.1 格，超出触及范围 3.0 格","data":{"distance":4.1,"maxReach":3.0}}}
+{"jsonrpc":"2.0","id":1,"error":{"code":-32003,"message":"目标超出触及距离，需先走近","data":{"distance":4.1,"reach":3.0}}}
 ```
 
-错误码：
+错误码与协议边界（notification、params 必须为对象、不支持批量等）详见 [RPC API 参考](docs/rpc-api.md)。
 
 | code | 含义 |
 |------|------|
-| -32700 | 请求解析失败（非合法 JSON）|
+| -32700 | 请求解析失败（非合法 JSON / 批量数组）|
 | -32600 | 无效请求（缺 `method`、jsonrpc 版本不符、params 非对象）|
 | -32601 | 未知方法 |
-| -32602 | 无效参数（必传参数缺失）|
+| -32602 | 无效参数（必传缺失 / 枚举非法）|
 | -32000 | 超时（操作未在限定时间内完成）|
-| -32001 | 玩家未进世界 |
-| -32002 | 目标不存在 |
-| -32003 | 超出触及范围 |
-| -32004 | 操作忙（已有同类高级指令在执行）|
+| -32001 | 未就绪（未进世界 / 被界面拦截 / 未开交易屏）|
+| -32002 | 目标或存档不存在 |
+| -32003 | 超出触及范围（`data` 含 distance/reach）|
+| -32004 | 操作忙（已有同类高级会话在执行）|
 | -32603 | 其他内部异常 |
 
-> -32000 及以上（数值上更小）为本框架业务错误码区间，`error.data` 可能携带结构化细节。
+> -32000 ~ -32099 为本框架业务错误码区间。
 
 最小调用：
 
