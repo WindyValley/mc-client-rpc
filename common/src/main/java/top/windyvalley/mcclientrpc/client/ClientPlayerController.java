@@ -92,6 +92,23 @@ public final class ClientPlayerController {
     private volatile AttackSession attackSession;
 
     /**
+     * 进入单机存档会话：openWorld 异步加载，可能停在 BackupConfirmScreen
+     * （旧/降级/实验性世界）。由 tick 每帧驱动：自动点「备份并加入」继续，
+     * 成功进世界或遇错误屏/超时后完成 future。
+     */
+    private record EnterSession(String levelId, boolean backup,
+                                CompletableFuture<Object> future,
+                                long deadlineMs, boolean loadingSeen) {
+        EnterSession withLoading() {
+            return new EnterSession(levelId, backup, future, deadlineMs, true);
+        }
+    }
+
+    private volatile EnterSession enterSession;
+    /** enter 总超时（ms）：含备份压缩与世界加载。 */
+    private static final long ENTER_TIMEOUT_MS = 120_000;
+
+    /**
      * 延迟命中判定：攻击已经真实发起，等若干 tick 让服务端同步目标血量，
      * 再读血量判定命中、完成 future。目标实体的血量是服务端权威，
      * 攻击同帧在客户端读不到变化（实测服务端已 17→16，客户端仍读到 17）。
@@ -231,6 +248,12 @@ public final class ClientPlayerController {
             }
         }
 
+        // 3.5 进入单机存档会话：驱动异步加载、自动处理备份确认屏。
+        EnterSession es = enterSession;
+        if (es != null) {
+            driveEnterSession(es);
+        }
+
         // 4. 延迟命中判定:倒计 tick,到期读服务端已同步的血量组装结果。
         if (!pendingHits.isEmpty()) {
             java.util.Iterator<PendingHit> it = pendingHits.iterator();
@@ -350,9 +373,15 @@ public final class ClientPlayerController {
                         bool(p, "generateStructures", true),
                         bool(p, "bonusChest", false),
                         str(p, "preset", "normal")));
-        registerClient(d, "world.enter", "进入已有单机存档（走官方 openWorld，等价 quickPlay 单机；发起后轮询 inWorld）",
-                List.of(RpcParamSpec.required("id", "string", "存档目录名（world.list 返回的 id）")),
-                120000, p -> enterWorld(required(p, "id")));
+        registerClientDeferred(d, "world.enter",
+                "进入已有单机存档（官方 openWorld，等价 quickPlay 单机）。旧/降级/实验性存档弹"
+                        + "备份确认框时自动点「备份并加入」（先压缩备份到 backups/ 再加载）；"
+                        + "返回时已真正进入世界",
+                List.of(RpcParamSpec.required("id", "string", "存档目录名（world.list 返回的 id）"),
+                        RpcParamSpec.optional("backup", "boolean", true,
+                                "遇备份确认框是否先备份（默认 true；false=跳过备份直接加载）")),
+                130000, p -> future -> startEnterWorld(required(p, "id"),
+                        bool(p, "backup", true), future));
 
 
         // ── 进入世界后（玩家操控）──
@@ -749,25 +778,116 @@ public final class ClientPlayerController {
     }
 
     /**
-     * 进入已有单机存档 —— 走官方 {@code WorldOpenFlows.openWorld}，与
-     * quickPlay {@code --quickPlaySingleplayer <id>} 完全同路径（含版本兼容/备份确认）。
-     * 全新同版本存档不会弹任何确认框；旧版本存档可能停在备份确认 Screen，
-     * 此时 client.status.screen 非 null，需要真人或后续原语处理，这里不自动点确认。
+     * 进入已有单机存档（会话式）—— 走官方 {@code WorldOpenFlows.openWorld}，与
+     * quickPlay {@code --quickPlaySingleplayer <id>} 同路径。发起后由
+     * {@link #tick()} → {@link #driveEnterSession} 驱动到真正进世界。
+     *
+     * <p>旧/降级/实验性存档会停在 {@code BackupConfirmScreen}：自动化场景下自动
+     * 点「备份并加入」——其回调内 {@code EditWorldScreen.makeBackupAndShowToast}
+     * 先同步把整个存档压缩到 backups/ 再继续加载，与真人点该按钮完全同路径；
+     * backup=false 时点「跳过备份」。不兼容/数据包失败等 AlertScreen 不自动放过，
+     * 直接报错回主菜单，避免把打不开的世界误判为成功。
      */
-    private String enterWorld(String id) {
+    private void startEnterWorld(String id, boolean backup, CompletableFuture<Object> rpc) {
         if (mc.player != null) {
-            throw new RpcException(RpcErrorCodes.NOT_READY,
-                    "已在世界中，先 client.disconnect 再进入");
+            rpc.completeExceptionally(new RpcException(RpcErrorCodes.NOT_READY,
+                    "已在世界中，先 client.disconnect 再进入"));
+            return;
+        }
+        if (enterSession != null) {
+            rpc.completeExceptionally(new RpcException(RpcErrorCodes.BUSY,
+                    "已有进入存档会话进行中: " + enterSession.levelId()));
+            return;
         }
         String levelId = id.trim();
         if (!mc.getLevelSource().levelExists(levelId)) {
-            throw new RpcException(RpcErrorCodes.TARGET_NOT_FOUND,
-                    "存档不存在: " + levelId, java.util.Map.of("id", levelId));
+            rpc.completeExceptionally(new RpcException(RpcErrorCodes.TARGET_NOT_FOUND,
+                    "存档不存在: " + levelId, java.util.Map.of("id", levelId)));
+            return;
         }
+        enterSession = new EnterSession(levelId, backup, rpc,
+                System.currentTimeMillis() + ENTER_TIMEOUT_MS, false);
         mc.setScreen(new TitleScreen());
         mc.createWorldOpenFlows().openWorld(levelId, () -> mc.setScreen(new TitleScreen()));
-        return "已发起进入存档 " + levelId + "（异步加载，用 client.status 轮询 inWorld；"
-                + "若停在 BackupConfirmScreen 表示旧版本需人工确认）";
+    }
+
+    /** tick 驱动：每帧检查 enter 会话的屏幕状态机（只在 render thread 调）。 */
+    private void driveEnterSession(EnterSession es) {
+        CompletableFuture<Object> f = es.future();
+        if (f.isDone()) {
+            enterSession = null;
+            return;
+        }
+        if (System.currentTimeMillis() > es.deadlineMs()) {
+            enterSession = null;
+            String scr = mc.screen == null ? "null" : mc.screen.getClass().getSimpleName();
+            f.completeExceptionally(new RpcException(RpcErrorCodes.TIMEOUT,
+                    ENTER_TIMEOUT_MS / 1000 + "s 内未进入存档 " + es.levelId()
+                            + "（停在 " + scr + "）",
+                    java.util.Map.of("id", es.levelId(), "screen", scr)));
+            return;
+        }
+
+        var screen = mc.screen;
+        // 成功：玩家与关卡就绪且无拦截界面
+        if (mc.player != null && mc.level != null && screen == null) {
+            enterSession = null;
+            f.complete("已进入存档 " + es.levelId()
+                    + (es.backup() ? "（如遇备份确认已自动备份并加入）" : "（跳过备份）"));
+            return;
+        }
+
+        if (screen instanceof net.minecraft.client.gui.screens.BackupConfirmScreen bcs) {
+            net.minecraft.client.gui.components.Button target = null;
+            int btnIdx = 0;
+            for (var child : bcs.children()) {
+                if (child instanceof net.minecraft.client.gui.components.Button b) {
+                    // addRenderableWidget 顺序：0=备份并加入, 1=跳过备份, 2=取消
+                    if ((es.backup() && btnIdx == 0) || (!es.backup() && btnIdx == 1)) {
+                        target = b;
+                        break;
+                    }
+                    btnIdx++;
+                }
+            }
+            McClientRpc.LOGGER.info("[RPC] 存档 {} 停在备份确认屏，自动点「{}」",
+                    es.levelId(), es.backup() ? "备份并加入" : "跳过备份");
+            if (target != null) {
+                target.onPress(); // 备份分支内部同步压缩存档后继续官方加载链
+            } else {
+                enterSession = null;
+                f.completeExceptionally(new RpcException(RpcErrorCodes.INTERNAL_ERROR,
+                        "BackupConfirmScreen 上找不到确认按钮"));
+            }
+            return;
+        }
+
+        // 不兼容 / 数据包加载失败 / 符号链接警告：不自动放过，交还给调用方
+        if (screen instanceof net.minecraft.client.gui.screens.AlertScreen
+                || screen instanceof net.minecraft.client.gui.screens.DatapackLoadFailureScreen
+                || screen instanceof net.minecraft.client.gui.screens.NoticeWithLinkScreen) {
+            enterSession = null;
+            String name = screen.getClass().getSimpleName();
+            mc.setScreen(new TitleScreen());
+            f.completeExceptionally(new RpcException(RpcErrorCodes.NOT_READY,
+                    "进入存档 " + es.levelId() + " 被 " + name
+                            + " 拦截（版本不兼容/数据包失败/链接目录），未自动确认",
+                    java.util.Map.of("id", es.levelId(), "screen", name)));
+            return;
+        }
+
+        // 加载中（GenericMessageScreen/LevelLoadingScreen/ReceivingLevelScreen）继续等
+        if (screen != null && !(screen instanceof TitleScreen)) {
+            enterSession = es.withLoading();
+            return;
+        }
+        // 仍在 TitleScreen：openWorld 刚发起的首几帧正常；发起后又回到标题=失败
+        if (es.loadingSeen()) {
+            enterSession = null;
+            f.completeExceptionally(new RpcException(RpcErrorCodes.INTERNAL_ERROR,
+                    "进入存档 " + es.levelId() + " 中途回到标题屏（读取失败？查客户端日志）",
+                    java.util.Map.of("id", es.levelId())));
+        }
     }
 
     /**
