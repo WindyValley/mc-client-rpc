@@ -134,11 +134,13 @@
 - 错误：已在世界中 -32001；空 name / 非法 gameMode/difficulty/preset -32602。
 
 ### `world.enter`
-进入已有单机存档。走官方 `openWorld`，与启动参数 `--quickPlaySingleplayer <id>` 完全同路径（含版本兼容检查）。
-- 参数：`id`（string，**必传**，`world.list` 返回的目录名）
-- 返回：`已发起进入存档 <id>（异步加载，用 client.status 轮询 inWorld…）`
-- 全新同版本存档无确认框直接进；**旧版本 / 实验性存档会停在 `BackupConfirmScreen`**（screen 非 null），当前不自动点确认，需真人或后续原语处理。
-- 错误：已在世界中 -32001；id 不存在 -32002（data 含 id）。
+进入已有单机存档。走官方 `openWorld`，与启动参数 `--quickPlaySingleplayer <id>` 完全同路径（含版本兼容检查）。**阻塞到真正进入世界**（tick 会话驱动，最长约 120 秒）。
+- 参数：
+  - `id`（string，**必传**，`world.list` 返回的目录名）
+  - `backup`（boolean，可选，默认 `true`）：遇到备份确认屏（降级/旧版/实验性世界）时，`true` = 自动点「备份并加入」，先压缩整档到 `run/backups/<时间戳>.zip` 再继续加载（与真人点按钮同路径）；`false` = 点「直接加载」跳过备份。
+- 返回：`已进入存档 <id>`（或 `…（已自动备份后继续）`/`…（跳过备份直接加载）`）。
+- 降级加载期间若再弹出数据包/不兼容错误屏，返回 -32001（data.screen 标明屏名）；超 120 秒未进世界返回 -32000。
+- 错误：已在世界中 -32001；id 不存在 -32002（data 含 id）；backup 非布尔 -32602。
 
 ---
 
