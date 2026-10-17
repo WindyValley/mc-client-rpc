@@ -23,7 +23,7 @@ Minecraft 客户端 JSON-RPC 控制框架（Architectury 双端：NeoForge + Fab
 
 mc-client-rpc 在 **Minecraft 客户端进程内**开一个 JSON-RPC 服务，外部测试脚本（如 Python）通过它驱动一个真实连入服务器的玩家：走位、攻击、跳跃、转头、发命令/聊天，并读取玩家与周围世界状态。
 
-它最初是为验证 [example-mod](https://github.com/WindyValley/example-mod) 而抽出的通用工具，但本身与具体被测 mod 无关——任何需要「自动化真实玩家」的场景都可用。
+本框架把「自动化真实玩家」做成独立工具，本身与具体被测 mod 无关——任何需要驱动一个真实连入服务器的玩家的场景都可用。
 
 ---
 
@@ -171,9 +171,19 @@ Python 调用示例见 [`scripts/combat_loop_test.py`](scripts/combat_loop_test.
 | `rcon.py` | 纯标准库 Source RCON 客户端（直连服务器发管理命令）|
 | `launch_and_connect.py` | 启动客户端 → 等标题屏稳定 → 连接服务器 |
 | `kill_mc_java.py` | 清理残留 MC 客户端 java 进程（保留 Gradle daemon）|
-| `deploy_mod_jar.py` | 构建并部署 example-mod 到测试服（示例用途）|
 
 一次性/调试脚本放 `scripts/_temp/`（已 git 忽略）。
+
+测试脚本不内置任何具体主机、账号或工程路径，连接参数全部走环境变量：
+
+| 环境变量 | 作用 | 默认 |
+|---|---|---|
+| `RCON_PASSWORD` | RCON 密码（首选） | 无 |
+| `MCRPC_RCON_HOST` / `MCRPC_RCON_PORT` | RCON 主机/端口 | `127.0.0.1` / `25575` |
+| `MCRPC_SERVER_HOST` / `MCRPC_SERVER_PORT` | 被测 MC 服务器地址 | `127.0.0.1` / `25565` |
+| `MCRPC_SSH_TARGET` | 可选 `user@host`，未给密码时经 ssh 读 `rcon.password`、或读服务器日志 | 空（不使用 ssh） |
+| `MCRPC_SERVER_DIR` / `MCRPC_SERVER_LOG` | 服务器目录 / 日志路径 | `~/minecraft` / `~/minecraft/logs/latest.log` |
+| `MCRPC_CLIENT_PROJECT` | 被测客户端工程根目录（含 gradlew，`launch_and_connect.py` 用） | 无，必须显式设置 |
 
 ---
 
@@ -182,7 +192,7 @@ Python 调用示例见 [`scripts/combat_loop_test.py`](scripts/combat_loop_test.
 - **协议层**（`common/.../protocol/`）：纯 JUnit，与 MC 解耦，覆盖 JSON-RPC 解析 / 路由 / 错误码 / 异常隔离。
 - **操控层**（`common/.../client/ClientPlayerController`）：依赖真实 MC runtime（玩家实体、世界、网络），纯单测造不出来，由真机自动化脚本验证。
 
-本框架已在真机上驱动验证了 example-mod 的多类生物（近战 / 远程 / Brain 系），攻击、走位、跳跃、示警、脱战等路径均实际跑通。
+本框架已在真机上驱动验证了多类生物（近战 / 远程 / Brain 系），攻击、走位、跳跃、示警、脱战等路径均实际跑通。
 
 ---
 

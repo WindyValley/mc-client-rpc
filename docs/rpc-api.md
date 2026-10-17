@@ -160,7 +160,7 @@ Minecraft 的游戏状态只允许在 render thread 访问。所有方法的实�
 | `screen` | string\|null | 当前 Screen 类简单名（如 `TitleScreen`、`MerchantScreen`）；游戏中无界面为 null |
 | `inWorld` | boolean | 玩家与关卡均非空 |
 | `connected` | boolean | 网络连接存在且仍连通 |
-| `server` | string\|null | 当前服务器地址（如 `127.0.0.1:25565`），单机为 null |
+| `server` | string\|null | 当前服务器地址（如 `203.0.113.10:25565`，示例地址），单机为 null |
 
 #### `client.toTitle`
 无条件切到 `TitleScreen`，跳过无障碍引导屏等拦路界面。
