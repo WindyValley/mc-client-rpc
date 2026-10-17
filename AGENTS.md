@@ -8,7 +8,6 @@ mc-client-rpc —— Minecraft 客户端 JSON-RPC 自动化测试框架，Archit
 在 MC 客户端进程内开 RPC 服务（端口 25586），调用客户端真实输入 API，让客户端真的发攻击/移动包，
 走完整的 输入→网络→服务端 管线。与「服务端直接伪造状态」的验证方式互补。
 
-- 路径：`D:/Coding/projects/mc-client-rpc`
 - MC 1.21.1 + Java 21，NeoForge 21.1.250，modid `mcclientrpc`
 - 构建参数以 `gradle.properties` 为准；Gradle 版本同 wrapper，不要升 9.x
 
