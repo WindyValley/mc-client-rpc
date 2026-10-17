@@ -26,11 +26,12 @@ import sys
 import time
 
 RPC_HOST, RPC_PORT = "127.0.0.1", 25586
-SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 25565
-# 被测工程（runClient 入口；可用环境变量覆盖）
-MCRPC_CLIENT_PROJECT = os.environ.get(
-    "MCRPC_CLIENT_PROJECT", r"D:\Coding\projects\example-mod")
+# 测试服主机/端口可用环境变量覆盖，默认本机
+SERVER_HOST = os.environ.get("MCRPC_SERVER_HOST", "127.0.0.1")
+SERVER_PORT = int(os.environ.get("MCRPC_SERVER_PORT", "25565"))
+# 被测客户端工程（runClient 入口）：由环境变量 MCRPC_CLIENT_PROJECT 指向，
+# 框架不内置任何具体项目路径
+PROJECT_DIR = os.environ.get("MCRPC_CLIENT_PROJECT")
 
 BOOT_TIMEOUT = 240      # 客户端启动到 RPC 就绪最长等
 CONNECT_TIMEOUT = 90    # 发起连接到进入世界最长等
@@ -82,15 +83,19 @@ def at_title(status):
 
 
 def launch_client():
-    gradlew = os.path.join(MCRPC_CLIENT_PROJECT, "gradlew.bat")
+    if not PROJECT_DIR:
+        raise RuntimeError(
+            "未设置被测客户端工程：请用环境变量 MCRPC_CLIENT_PROJECT 指向"
+            "含 gradlew 的工程根目录")
+    gradlew = os.path.join(PROJECT_DIR, "gradlew.bat")
     if not os.path.exists(gradlew):
-        raise RuntimeError(f"找不到 {gradlew}，设环境变量 MCRPC_CLIENT_PROJECT 指向被测工程")
-    logfile = open(os.path.join(MCRPC_CLIENT_PROJECT, "runClient_auto.log"), "ab")
+        raise RuntimeError(f"找不到 {gradlew}，检查环境变量 MCRPC_CLIENT_PROJECT")
+    logfile = open(os.path.join(PROJECT_DIR, "runClient_auto.log"), "ab")
     # 独立进程组 + 脱离控制台，脚本退出后客户端继续跑
     flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     subprocess.Popen(
         ["cmd", "/c", "gradlew.bat", ":neoforge:runClient"],
-        cwd=MCRPC_CLIENT_PROJECT, stdout=logfile, stderr=subprocess.STDOUT,
+        cwd=PROJECT_DIR, stdout=logfile, stderr=subprocess.STDOUT,
         creationflags=flags, close_fds=True)
     log("已发起 runClient（日志：runClient_auto.log）")
 

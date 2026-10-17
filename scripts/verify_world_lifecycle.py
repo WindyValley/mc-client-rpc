@@ -3,7 +3,7 @@
 """world.list / world.create / world.enter 真机验证（mc-client-rpc 自身 runClient）。
 
 一条命令跑完整生命周期：
-  1. 起 :neoforge:runClient（工程自身 classpath，零 MOD 类），等 25586 + 标题屏稳定
+  1. 起 :neoforge:runClient（工程自身 classpath，不含任何被测 mod 的类），等 25586 + 标题屏稳定
   2. methods.list 自描述里应含三个新方法
   3. world.list 记录初始存档
   4. world.create：flat + creative + 文本种子 hello + 奖励箱 → 轮询 inWorld，

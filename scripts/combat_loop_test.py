@@ -49,8 +49,8 @@ from pathlib import Path
 RPC_HOST = "127.0.0.1"
 RPC_PORT = 25586
 
-# 测试服务器（召唤生物用，本机直连 RCON，不绕 ssh）
-SERVER_HOST = "127.0.0.1"
+# 测试服务器（召唤生物用，本机直连 RCON，不绕 ssh）；用环境变量 MCRPC_SERVER_HOST 指定
+SERVER_HOST = os.environ.get("MCRPC_SERVER_HOST", "127.0.0.1")
 SERVER_RCON_PORT = 25575
 PLAYER_NAME = "Dev"                # 测试玩家名（OP 授权/指令作用对象）
 SUMMON_MOB = "minecraft:zombie"      # 用于测反击的中立化生物
@@ -133,8 +133,8 @@ def rpc_ok(method: str, params: dict | None = None, timeout: float = 8.0) -> boo
 def server_rcon(command: str) -> str:
     """经本地直连 RCON 在测试服执行一条命令，返回文本响应。
 
-    不再绕 ssh：密码经 ssh 读一次（见 rcon.get_password）后，所有命令
-    直连 127.0.0.1:25575，时序由本机脚本统一掌控。
+    密码从环境变量 RCON_PASSWORD 取（或由 MCRPC_SSH_TARGET 经 ssh 读取，
+    见 rcon.get_password）；主机/端口取上方 SERVER_HOST/SERVER_RCON_PORT。
     """
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import rcon  # scripts/rcon.py

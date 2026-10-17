@@ -25,9 +25,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rcon import Rcon
 
 HOST, PORT = "127.0.0.1", 25586
-RCON_HOST, RCON_PORT = "127.0.0.1", 25575
-SSH_TARGET = "dev@127.0.0.1"
-SERVER_LOG = "~/minecraft/logs/latest.log"
+# 测试服 RCON / ssh 均由环境变量提供，默认本机；chat 阶段需要 ssh 读日志
+RCON_HOST = os.environ.get("MCRPC_SERVER_HOST", "127.0.0.1")
+RCON_PORT = int(os.environ.get("MCRPC_SERVER_RCON_PORT", "25575"))
+SSH_TARGET = os.environ.get("MCRPC_SSH_TARGET", "")
+SERVER_LOG = os.environ.get("MCRPC_SERVER_LOG", "~/minecraft/logs/latest.log")
 
 _next_id = 0
 
@@ -133,6 +135,9 @@ def stage_chat(rc):
     marker = "MCRPCMARK_" + uuid.uuid4().hex[:8]
     err, res = rpc("player.chat", {"msg": marker})
     check("客户端发 chat 无错误", not err, str(res))
+    if not SSH_TARGET:
+        print("  [skip] 未配置 MCRPC_SSH_TARGET，跳过服务器日志落地校验")
+        return
     found = False
     for _ in range(6):
         p = subprocess.run(["ssh", SSH_TARGET, f"grep -c {marker} {SERVER_LOG}"],
