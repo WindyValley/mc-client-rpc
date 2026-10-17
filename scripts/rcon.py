@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-本地 Source RCON 客户端 —— 开发机直连服务端，不绕 ssh。
+本地 Source RCON 客户端 —— 直连服务端，不绕 ssh。
 
-把「测试脚本 → ssh → 服务端 server_rcon.py」的多跳，改成
-「测试脚本 → 本机直连 127.0.0.1:25575」。召唤/查询等控制指令
-的时序全由脚本在本机统一掌控，不再受 ssh 往返与回显不稳定影响。
+测试脚本直接 RCON 连服务端发召唤/查询等管理指令，时序由脚本在本机
+统一掌控，不受 ssh 往返与回显不稳定影响。连接目标与密码全部参数化
+（见下方环境变量），不含任何写死的主机/账号。
 
 协议：Source RCON（Valve），Minecraft 服务端原生支持。
   包 = [int32 长度][int32 请求id][int32 类型][payload 字节][0x00 0x00]
@@ -121,29 +121,48 @@ class Rcon:
         return payload
 
 
-# ── 密码来源：运行时经 ssh 读一次（不落盘），或环境变量 ─────────────
+# ── 连接参数：全部可用环境变量覆盖，默认只绑回环，不含任何写死主机/账号 ──────
+#
+#   RCON_PASSWORD      直接给 RCON 密码（首选，CI/本机都用它）
+#   MCRPC_RCON_HOST    open_default 默认主机（默认 127.0.0.1）
+#   MCRPC_RCON_PORT    默认端口（默认 25575）
+#   MCRPC_SSH_TARGET   可选：形如 user@host，配置后若未给 RCON_PASSWORD，
+#                      则经 ssh 到服务器读 rcon.password（不落盘）
+#   MCRPC_SERVER_DIR   服务器工作目录（默认 ~/minecraft），ssh 读密码用
 
-# 服务端 ssh / 工作目录（读 RCON 密码、ops.json 等服务器文件用）
-DEFAULT_SSH = "dev@127.0.0.1"
-DEFAULT_WORK_DIR = "~/minecraft"
+import os
+
+DEFAULT_HOST = os.environ.get("MCRPC_RCON_HOST", "127.0.0.1")
+DEFAULT_PORT = int(os.environ.get("MCRPC_RCON_PORT", "25575"))
+DEFAULT_SSH = os.environ.get("MCRPC_SSH_TARGET", "")
+DEFAULT_WORK_DIR = os.environ.get("MCRPC_SERVER_DIR", "~/minecraft")
+PASSWORD_ENV = "RCON_PASSWORD"
 
 _PASSWORD_CACHE: str | None = None
 
 
-def get_password(ssh_target: str = DEFAULT_SSH,
-                 work_dir: str = DEFAULT_WORK_DIR) -> str:
-    """取 RCON 密码。优先环境变量 RCON_PASSWORD；否则经 ssh 读一次并缓存。
+def get_password(ssh_target: str | None = None,
+                 work_dir: str | None = None,
+                 password: str | None = None) -> str:
+    """取 RCON 密码。优先级：显式参数 > 环境变量 RCON_PASSWORD > 经 ssh 读一次并缓存。
 
-    密码只存在内存，不写入任何文件。
+    密码只存在内存，不写入任何文件。三种来源都没有时抛 RconError。
     """
     global _PASSWORD_CACHE
+    if password is not None:
+        return password
     if _PASSWORD_CACHE:
         return _PASSWORD_CACHE
-    import os
-    pw = os.environ.get("RCON_PASSWORD")
+    pw = os.environ.get(PASSWORD_ENV)
     if pw:
         _PASSWORD_CACHE = pw
         return pw
+    ssh_target = ssh_target if ssh_target is not None else DEFAULT_SSH
+    work_dir = work_dir if work_dir is not None else DEFAULT_WORK_DIR
+    if not ssh_target:
+        raise RconError(
+            "未提供 RCON 密码：请设置环境变量 RCON_PASSWORD，"
+            "或配置 MCRPC_SSH_TARGET 以经 ssh 读取服务器 rcon.password")
     import subprocess
     out = subprocess.run(
         ["ssh", "-o", "BatchMode=yes", ssh_target,
@@ -157,9 +176,12 @@ def get_password(ssh_target: str = DEFAULT_SSH,
     return pw
 
 
-def open_default(host: str = "127.0.0.1", port: int = 25575) -> Rcon:
-    """用默认地址/密码打开一个 RCON 连接（密码自动从 ssh 或环境变量取）。"""
-    return Rcon(host, port, get_password())
+def open_default(host: str | None = None, port: int | None = None,
+                 password: str | None = None) -> "Rcon":
+    """用环境变量/参数解析出的地址与密码打开一个 RCON 连接。"""
+    h = host or DEFAULT_HOST
+    p = int(port) if port else DEFAULT_PORT
+    return Rcon(h, p, get_password(password=password))
 
 
 if __name__ == "__main__":
