@@ -1,6 +1,6 @@
 ---
 name: "mc-client-rpc"
-description: "mc-client-rpc 工具操作：JSON-RPC 连接协议、客户端生命周期、RCON 与部署。"
+description: "mc-client-rpc 操作：RPC 连接、生命周期、RCON 部署；转公开脱敏门禁。"
 ---
 
 # mc-client-rpc 操作手册
@@ -99,3 +99,4 @@ rpc("player.pos")
 - `references/client-lifecycle.md` —— 启动/标题屏状态机、quickPlay、jar 替换、停客户端、纯净客户端模式
 - `references/rcon-direct.md` —— Source RCON 直连脚本用法、密码处理
 - `references/deploy-and-verify.md` —— 构建 jar 部署到测试服的一键流程与防假通过核对
+- `references/public-release-scrub.md` —— 转公开仓库前的脱敏验收门禁（含扫描脚本 `scripts/scrub_scan.py`：通用模式内置，项目私值走 `--patterns-file`、清单勿入仓库）
