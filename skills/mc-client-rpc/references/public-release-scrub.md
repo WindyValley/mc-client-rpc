@@ -21,6 +21,24 @@
    转公开前必须交用户拍板：`git filter-repo` 重写历史（改哈希、要强推），或书面接受
    「内网测试机地址非机密」。发布决策权在用户，agent 不自行重写历史、不自行 push。
 
+## 历史重写配方（已验证，用户拍板后执行）
+
+顺序：先提交完工作区脱敏，再重写历史（重写对最新提交同样生效），最后强推。
+
+1. **备份**：`git bundle create C:/<仓外路径>/pre-rewrite-<ts>.bundle --all`，`git bundle verify`
+   确认 complete history——重写不可逆的唯一回滚兜底。
+2. **取证定替换表**：`git rev-list --all` × `git grep -o` 枚举每个私值 token 的全部大小写形态；
+   严格排除合法英文词（如 MC 难度 `peaceful` 会被 peace 规则误伤）——只用精确字面串，长串/具体串排在短串前。
+3. **规则文件放仓库外**（清单本身是私值），`git filter-repo --replace-text <rules>` +
+   `--path <业务脚本> --invert-paths` 把已迁出脚本从全历史抹除；filter-repo 会移除 origin，
+   完成后 `git remote add` 重加。文件名引用（别处文字提及已删脚本名）需第二轮 --replace-text。
+4. **验收三件套**：全历史逐 rev `git grep` 私值零命中；**fresh clone 再扫一遍**（只信远程可达
+   历史而不是本地声明）；`git fsck --full` 干净。git grep 用 ERE，非捕获组 `(?:...)` 不支持，
+   用了会静默零匹配出假阴性——先用必中样本（如保留词）验证正则真的在匹配。
+5. **强推收尾**：`push --force-with-lease`，已并入 main 的旧 feature 分支要么删除要么一并强推
+   （只推 main 时旧分支仍暴露脏历史）；GitHub 私有仓旧 SHA 短期内仍可按哈希直达，转公开前
+   建议隔日复验。
+
 ## 提交纪律
 
 脱敏改动分批小步 commit（库 → 脚本 → 文档 → 配置类各一批），中文 message 写根因/修法/副作用。
