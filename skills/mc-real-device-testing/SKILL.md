@@ -99,7 +99,9 @@ Goal 系生物受击后的同族通知半径 = 其 `FOLLOW_RANGE`（僵尸 35、
 
 - 独立目录 + 错开游戏/RCON/调试端口；`online-mode=false`、`enforce-secure-profile=false`、超平坦。
 - Fabric 服用官方 installer 装；mods 放 fabric-api、架构层 mod、被测 remap jar。需要调试探针的包要显式开构建开关，并通过 JVM 属性错开探针端口。
-- 客户端从 **mc-client-rpc 工程**跑对应 loader 的 runClient（首次冷启动要下客户端依赖）。启动/连接参数走环境变量（如 `MCRPC_SERVER_HOST`、`MCRPC_CLIENT_PROJECT`；工具脚本已不内置默认服地址，缺必需变量会显式报错而不是静默导向某个环境）；若用外包等待脚本，沿用 RPC 就绪 → 标题屏稳定 → connect 的时序。
+- 客户端从 **mc-client-rpc 工程**跑对应 loader 的 runClient（首次冷启动要下客户端依赖）。启动/连接参数走环境变量（如 `MCRPC_SERVER_HOST`、`MCRPC_CLIENT_PROJECT`；工具脚本已不内置默认服地址，缺必需变量会显式报错而不是静默导向某个环境）；若用外包等待脚本，沿用 RPC 就绪 → 标题屏稳定 → connect 的时序。**就绪判据是「连续稳定可服务」，不是「端口能连上」**：冷启动 mod-init 阶段就打印「RPC 监听」，但客户端初始化未完成时连接能建立、请求不被处理（线程超时/空响应）。等 `client.status` 连续多次（间隔数秒）返回正常 dict 且 screen 稳定在标题屏（错误串/超时都算未就绪），再用一次真实只读调用（`world.list`）确认，然后才发进世界类指令。
+- **进世界瞬间的 RPC 重置要容错，别当致命错**：`world.create`/`world.enter` 在 Fabric 端可能重置当前连接（10054）或返回空响应，客户端却仍在正常进世界——吞掉异常后长轮询 `inWorld`（窗口给足），进了再继续。`world.create` 还可能只建出集成服、不把玩家带进世界（探针玩家数 0、客户端调用全线程超时）；此时改用 `world.enter` 进已建存档绕过，别反复重试 create。
+- **Windows 图形 runClient 在「断开」的 RDP 会话里起不来**：编译、mod 加载全部正常，死在起窗第一步 `glfwGetPrimaryMonitor failed`（EARLYDISPLAY）——断开的会话没有活动桌面/显示器，GLFW 无从起窗，与代码无关。`query user` 见会话状态「断开」即根因：让用户本地登录或重连 RDP 恢复活动会话再跑，并清掉残留 runClient（可能还弹着早期显示错误框等人点）。
 - **复用现有用例脚本不改仓库代码**：写 runner 用 importlib 逐个加载各用例的 main()，注入通道（RCON 端口、配置路径、探针地址都改成模块级变量注入），业务脚本零改动；runner 支持命令行只跑指定用例便于失败补跑。
 - 验完 RCON `stop` 优雅停副服（目录保留）、`client.quit` 关客户端、轮询副服端口全关并确认主服仍在。
 
@@ -108,8 +110,10 @@ Goal 系生物受击后的同族通知半径 = 其 `FOLLOW_RANGE`（僵尸 35、
 1. 写成独立 `.py`（write_file），终端只跑 `python xxx.py`；不内联复杂管道或 `python -c`。一次性脚本放 `_temp/`（git 忽略）。
 2. 每步带断言，失败即停并指明卡在哪步；退出码 0=PASS、非 0=失败。
 3. **自闭环时序**：等待/轮询/状态监测全在脚本内，只读最终结果，不在两个工具调用之间靠外部循环。先从字节码/配置算出机制总时长，观察窗覆盖完整行为周期并留 30%+ 余量（反扑类要算上怪重新接近的时间，不能只按「打完到掉血」的直感设窗）。
-4. try/finally 清理：关客户端（client.quit）、杀召唤实体、还原每一处 gamerule/时间/方块/配置/名单。只杀客户端、保留测试服和 Gradle daemon。
+4. try/finally 清理：关客户端（client.quit）、杀召唤实体、还原每一处 gamerule/时间/方块/配置/名单。只杀客户端、保留测试服和 Gradle daemon；异常中断后按「测试端口能否 bind + java 进程命令行含工程目录」精确清残留，别按进程名盲杀。
 5. 支持 `--attach` 复用已启动客户端调试；默认全自动起停（可进 CI）。
+6. **重试必须自愈，超距就贴脸**：attack/interact 报 OUT_OF_REACH(-32003) 后原地 sleep 重试永远失败——中立化的怪被击退后不会自己走回来，距离不变。命中超距就 `world.entities` 查最近目标坐标、把玩家 tp 到目标身位再试（该驱动按类型取最近实体、不依赖准星射线，同格可命中；走射线选取的路径才需留 1.5 格）。顺带盖掉「首次站位即超距」的偶发，封装成 attack_retry/interact_retry 一处复用。
+7. **失败样本必须带 RPC error.data；失败阶段漂移先做定点复现**：只打 message 分不清「选错目标/真超距/站位漂移」，data 里的 distance/reach 一眼定位。连续套件里每轮红的阶段不同、而各阶段单独复现全过 ⇒ 先怀疑跨阶段状态与时序而非该阶段代码：写最小定点复现（一次客户端内多轮该布局、多节奏对比命中率）再动代码。
 
 ## 参考
 
