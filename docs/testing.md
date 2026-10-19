@@ -70,6 +70,9 @@
 ### 脚本目录约定
 
 - 通用驱动与工具：`scripts/`（`combat_loop_test.py`、`rcon.py`、`launch_and_connect.py`、`kill_mc_java.py`）。
+- 不依赖 MC 的脚本逻辑用内嵌假 RPC server 做确定性回归：`scripts/test_launch_and_connect.py`
+  覆盖启动就绪判据（标题屏连续稳定、引导屏盖回重切）与 Fabric 进世界瞬间连接重置/空响应容错，
+  跑真机前可先 `python scripts/test_launch_and_connect.py` 快速验证（需先退出占用 25586 的真实客户端）。
 - 一次性 / 调试脚本：`scripts/_temp/`（git 已忽略，不入库）。
 - 脚本写成独立 `.py` 文件，终端只跑 `python xxx.py`，不内联复杂管道。
 

@@ -178,15 +178,26 @@ def rpc(method, params=None, timeout=130.0):
     req = {"jsonrpc": "2.0", "method": method, "id": 1}
     if params:
         req["params"] = params
-    with socket.create_connection((RPC_HOST, RPC_PORT), timeout=timeout) as s:
-        s.sendall((json.dumps(req) + "\n").encode("utf-8"))
-        s.settimeout(timeout)
-        buf = b""
-        while b"\n" not in buf:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
+    line = (json.dumps(req) + "\n").encode("utf-8")
+    buf = b""
+    try:
+        with socket.create_connection((RPC_HOST, RPC_PORT), timeout=timeout) as s:
+            s.sendall(line)
+            s.settimeout(timeout)
+            while b"\n" not in buf:
+                try:
+                    chunk = s.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+    except (OSError, ConnectionError) as e:
+        # 进/退世界瞬间连接层可能被重置（Fabric 10054）：这是传输问题、可由上层
+        # 按终态裁决，绝不能落到 json.loads 崩成解码异常。
+        raise RpcConnError(f"{method} 连接失败：{e}") from e
+    if not buf.strip():
+        raise RpcConnError(f"{method} 空响应（连接可能在进/退世界瞬间被重置）")
     resp = json.loads(buf.decode("utf-8").strip())
     if "error" in resp:
         e = resp["error"]
@@ -198,6 +209,10 @@ class RpcError(Exception):
     def __init__(self, code, message, data=None):
         super().__init__(f"[{code}] {message}")
         self.code, self.data = code, data
+
+
+class RpcConnError(RuntimeError):
+    """传输层失败（连接重置/超时/空响应）。常见于 Fabric 进/退世界瞬间，可容忍。"""
 
 
 def expect_error(code, method, params=None, timeout=130.0):
@@ -251,7 +266,12 @@ def settle_title():
     # 可能盖掉我们过早切出的 TitleScreen——观察期内发现被盖回就重切。
     stable, t0, last_force = 0.0, time.time(), 0.0
     while time.time() - t0 < 90:
-        st = rpc("client.status", timeout=5)
+        st = status_or_none(timeout=5)
+        if st is None:
+            # 瞬时连接重置：不判定、不重切，只中断连续计时继续等
+            stable = 0.0
+            time.sleep(POLL)
+            continue
         screen = st.get("screen")
         if screen == "TitleScreen" and not st.get("inWorld"):
             stable += POLL
@@ -262,18 +282,48 @@ def settle_title():
             if time.time() - last_force > 3:
                 try:
                     rpc("client.toTitle", timeout=5)
-                except Exception:
+                except (RpcConnError, RpcError):
                     pass
                 last_force = time.time()
         time.sleep(POLL)
     raise RuntimeError("标题屏未稳定")
 
 
+def status_or_none(timeout=8):
+    """client.status 的 dict 结果；进/退世界瞬间连接重置或业务异常时返回 None，
+    供轮询调用方继续等，而不是让瞬时 10054 直接打断整个用例。"""
+    try:
+        return rpc("client.status", timeout=timeout)
+    except (RpcConnError, RpcError):
+        return None
+
+
+def mutate_tolerant(label, fn):
+    """执行一个会触发进世界的变更调用（world.create / world.enter）。
+
+    Fabric 上该调用可能在进世界重建连接的瞬间收到空响应/重置，但世界其实正在
+    进入——此时按后续 wait_in_world / status 的终态裁决。fn【只执行一次】：
+    world.create 若盲目重试，第一次其实成功时会建出「名字 (1)」重名档，污染
+    后续对存档 id 的断言。返回 fn 的 result（传输失败时为 None）。
+    """
+    try:
+        r = fn()
+        print(f"[{label}] {r}")
+        return r
+    except RpcConnError as e:
+        print(f"[{label}] 进世界瞬间连接重置，按终态裁决（不重试变更）：{e}")
+        return None
+
+
 def wait_in_world(timeout=120):
     t0 = time.time()
     last_screen = None
     while time.time() - t0 < timeout:
-        st = rpc("client.status", timeout=10)
+        st = status_or_none(timeout=10)
+        if st is None:
+            # 进世界瞬间连接重建：RPC 暂不可用属预期，继续等，不判死。
+            time.sleep(POLL)
+            continue
         if st.get("inWorld") and st.get("screen") is None:
             return st
         if st.get("screen") != last_screen:
@@ -300,10 +350,9 @@ def main():
 
     flat_name = WORLD_PREFIX + "flat"
     # 3. 创建 flat 创造世界（文本种子，走 hashCode 路径）
-    r = rpc("world.create", {
+    mutate_tolerant("create-flat", lambda: rpc("world.create", {
         "name": flat_name, "seed": "hello", "gameMode": "creative",
-        "difficulty": "normal", "preset": "flat", "bonusChest": True})
-    print(f"[create-flat] {r}")
+        "difficulty": "normal", "preset": "flat", "bonusChest": True}))
     wait_in_world()
     pos = rpc("player.pos", timeout=10)
     print(f"[create-flat] 进世界 pos={pos}")
@@ -328,8 +377,7 @@ def main():
           and w["hardcore"] is False, "存档字段 creative/cheats=true", json.dumps(w, ensure_ascii=False))
 
     # 5. enter 重进
-    r = rpc("world.enter", {"id": fid}, timeout=130)
-    print(f"[enter] {r}")
+    mutate_tolerant("enter", lambda: rpc("world.enter", {"id": fid}, timeout=130))
     wait_in_world()
     pos2 = rpc("player.pos", timeout=10)
     check(abs(pos2["y"] - FLAT_Y) <= 2, "enter 重进后仍在 flat(y=-60)", f"y={pos2['y']}")
@@ -350,10 +398,9 @@ def main():
 
     # 8. normal 生存 + 数字种子，出生高度应明显高于平坦
     norm_name = WORLD_PREFIX + "normal"
-    r = rpc("world.create", {
+    mutate_tolerant("create-normal", lambda: rpc("world.create", {
         "name": norm_name, "seed": 12345, "gameMode": "survival",
-        "difficulty": "easy", "preset": "normal", "allowCheats": False})
-    print(f"[create-normal] {r}")
+        "difficulty": "easy", "preset": "normal", "allowCheats": False}))
     wait_in_world()
     pos3 = rpc("player.pos", timeout=10)
     print(f"[create-normal] pos={pos3}")
@@ -367,7 +414,8 @@ def main():
         if backups_dir.exists() else set()
 
     dg_name = WORLD_PREFIX + "downgrade"
-    rpc("world.create", {"name": dg_name, "preset": "flat", "gameMode": "creative"})
+    mutate_tolerant("create-downgrade", lambda: rpc(
+        "world.create", {"name": dg_name, "preset": "flat", "gameMode": "creative"}))
     wait_in_world()
     rpc("client.disconnect", timeout=15)
     settle_title()  # 必须等内置服完全退出、释放 level.dat 文件锁
@@ -375,9 +423,9 @@ def main():
     dg_dat = SAVES / dg_name / "level.dat"
     bump_leveldat_version_id(dg_dat, 9999)  # 3955 → 9999 造降级警告
     # 阻塞式：返回时应已自动点「备份并加入」并进世界
-    r = rpc("world.enter", {"id": dg_name}, timeout=130)
-    print(f"[downgrade-backup] {r}")
-    st = rpc("client.status", timeout=5)
+    mutate_tolerant("downgrade-backup", lambda: rpc(
+        "world.enter", {"id": dg_name}, timeout=130))
+    st = wait_in_world()
     check(st.get("inWorld") and st.get("screen") is None,
           "降级档自动备份后已进入世界", json.dumps(st, ensure_ascii=False))
     # backups/ 下应出现含该 levelId 的新 zip
@@ -390,15 +438,16 @@ def main():
 
     # 9b. backup=false：同样的降级档，跳过备份，不产生新 zip，仍进入
     dg2_name = WORLD_PREFIX + "downgrade-nobak"
-    rpc("world.create", {"name": dg2_name, "preset": "flat", "gameMode": "creative"})
+    mutate_tolerant("create-downgrade-nobak", lambda: rpc(
+        "world.create", {"name": dg2_name, "preset": "flat", "gameMode": "creative"}))
     wait_in_world()
     rpc("client.disconnect", timeout=15)
     settle_title()
     bump_leveldat_version_id(SAVES / dg2_name / "level.dat", 9999)
     zips_before2 = {p.name for p in backups_dir.glob("*mcrpc-wl-*.zip")}
-    r = rpc("world.enter", {"id": dg2_name, "backup": False}, timeout=130)
-    print(f"[downgrade-nobackup] {r}")
-    st = rpc("client.status", timeout=5)
+    mutate_tolerant("downgrade-nobackup", lambda: rpc(
+        "world.enter", {"id": dg2_name, "backup": False}, timeout=130))
+    st = wait_in_world()
     check(st.get("inWorld") and st.get("screen") is None,
           "backup=false 跳过备份后也进入世界", json.dumps(st, ensure_ascii=False))
     zips_after2 = {p.name for p in backups_dir.glob("*mcrpc-wl-*.zip")}
@@ -408,9 +457,8 @@ def main():
     settle_title()
 
     # 10. 重名自动 (1)，不覆盖旧档
-    r = rpc("world.create", {"name": flat_name, "preset": "flat",
-                             "gameMode": "creative"})
-    print(f"[create-dup] {r}")
+    mutate_tolerant("create-dup", lambda: rpc("world.create", {
+        "name": flat_name, "preset": "flat", "gameMode": "creative"}))
     wait_in_world()
     rpc("client.disconnect", timeout=15)
     settle_title()
