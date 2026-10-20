@@ -78,6 +78,24 @@ Goal 系生物受击后的同族通知半径 = 其 `FOLLOW_RANGE`（僵尸 35、
 - **临时改服务器配置**：数值/布尔项改配置文件（读回确认）+ 热重载，开始前备份、finally 恢复。注意很多入世界时的中立化/标记**只对之后新召唤的实体生效**，改完要重召。setup 里每改一处（gamerule/time/方块/配置/名单）当场在 finally 登记还原，别靠事后回忆。
 - 任务卡/文档骨架可能停在上个迭代节点：开工先 `git log --oneline` 对照现状，过期的重写而不是照做。
 
+## 测试身份与权限：OP 生命周期是「恢复」不是「移除」
+
+需要变更玩家 OP 状态时：
+
+- **进入前记原态、finally 恢复**：先 `is_op(player)` 记录，退出时还原成原样（原本是 OP 就恢复 OP，原本不是就 deop），脚本退出后不应改动服务器配置。恢复操作自身报错只打印警告、不掩盖用例主结果。OP 变更走 RCON，不依赖玩家在线。
+- **OP 是身份变量，不是发令手段**：授 OP 只用于测「OP 玩家的行为差异」；召唤 / kill / gamemode 等服务管理指令一律走 RCON，与玩家是否 OP 无关。`player.command` 保留为发指令的通用能力（可测 OP/非 OP 指令范围），但自动化的控制通道用 RCON。
+- **RCON 的 `op/deop` 要玩家名、不是 `@s`**：RCON 在控制台执行、`@s` 无实体上下文。跨 loader 玩家名不同（NeoForge dev 常见 `Dev`、Fabric loom 是 `Player###`），从 `player.state` 取实际名字，别写死。
+
+```python
+original_op = is_op(name)          # 进入前记原态
+try:
+    set_op(name, False)            # 需要非 OP 就 deop，需要 OP 就 True
+    ... 用例体 ...
+finally:
+    if original_op:
+        set_op(name, True)         # 恢复原状，不是无条件 deop
+```
+
 ## 探针纪律（使用方自带的调试通道）
 
 - **先把判据字段在探针里写全再部署**：真机判定依赖哪些时钟/状态（如双时钟要同时读 gameTime 与 dayTime），先加字段再跑。跑到一半发现缺字段意味着重构建+重部署+重跑一整轮。
