@@ -23,6 +23,17 @@
 ssh("cd <server-dir> && setsid sh -c 'sh run.sh nogui > server_stdout.log 2>&1 < /dev/null' &")
 ```
 
+**需要长稳托管（机器重启自动拉起、日志统一收集）时改用 `systemd-run --user`**——setsid 只 detach 当前会话，不负责重启或拉起：
+
+```bash
+# 前提：该用户已 loginctl enable-linger，否则用户退出后 user manager 不跑、unit 不被拉起
+systemd-run --user --unit=mc-test --working-directory=<server-dir> ./run.sh
+journalctl --user -u mc-test -f     # 跟踪日志
+systemctl --user stop mc-test       # 停服
+```
+
+无论哪种启动，就绪判据仍是端口监听 + RCON `list`，不看 unit 是否 active。
+
 ## 判活陷阱
 
 - **pgrep 不要 `-f` 匹配命令行内容**：`pgrep -f 'neoforge/.../unix_args.txt'` 会匹配到**发起查询的 ssh 进程自身**（它的命令行里也含这个字符串），MC 早关了却每次都查到新的 ssh，死循环。用 `ss -ltn` 看端口，或 `pgrep -x java` 精确匹配进程名。
@@ -78,7 +89,7 @@ NeoForge installer 并发下载约 49+ 个库文件，部分服务器（含住�
 
 1. installer 跑一次让它失败并写日志（`neoforge-installer.jar.log`）。
 2. 抽 URL：`grep -oE 'https://[^ ]+\.jar' neoforge-installer.jar.log | sort -u > /tmp/urls.txt`。
-3. 写脚本逐个 curl 拉取，按 Maven URL 前缀剥离映射到 `libraries/` 子目录。
+3. 写脚本逐个 curl 拉取，按 Maven URL 前缀剥离映射到 `libraries/` 子目录。现成脚本：工程 `scripts/fill-neoforge-libs.sh <url文件> [服务器目录]`（自动剥离 maven.neoforged.net / repo.maven.apache.org / libraries.minecraft.net 前缀，已存在的跳过，失败的单列）。在测试服上跑，路径是 Linux 风格。
 4. 手工补错误输出里非 `.jar` 的项（如 `net.neoforged:neoform:...@zip`）。
 5. 重跑 installer——它检测到已存在文件就进入打补丁阶段。
 
